@@ -1,0 +1,28 @@
+# Copy to settings.toml and configure the sources you want to enable.
+# Keep credentials in the CLIs' own authentication stores, never in this file.
+[app]
+host = "127.0.0.1"
+port = 8765
+refresh_seconds = 180
+connector_timeout_seconds = 30
+activity_retention_days = 60
+stale_after_days = 30
+
+[azure_devops]
+enabled = false
+organization = "your-organization"
+expected_account = "you@example.com"
+cli_path = ""
+mention_reply_days = 30
+max_work_items = 1000
+max_comment_candidates = 250
+
+[jira]
+enabled = false
+site = "https://your-site.atlassian.net"
+expected_account = "you@example.com"
+cli_path = ""
+activity_projects = ["ENG"]
+mention_reply_days = 30
+participation_days = 90
+max_candidates_per_query = 1000

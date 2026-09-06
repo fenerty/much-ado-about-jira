@@ -1,0 +1,27 @@
+.venv/
+.tools/
+.runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+*.log
+
+# Private machine configuration and cached data
+settings.toml
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db
+*.db-*
+*.pem
+*.key
+*.pfx
+*.p12
+.auth/
+.playwright/
+artifacts/
