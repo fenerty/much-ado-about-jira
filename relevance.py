@@ -7,7 +7,7 @@ from models import Activity, ConnectorHealth, WorkItem
 
 
 HIGH_REASONS = {"mentioned", "replied", "reviewer", "requested_changes"}
-FOLLOW_REASONS = {"watching", "participant", "author", "waiting"}
+FOLLOW_REASONS = {"watching", "participant", "author", "waiting", "previously_assigned"}
 REASON_WEIGHT = {
     "mentioned": 100,
     "replied": 95,
@@ -87,7 +87,7 @@ def build_dashboard(
     assigned = [
         item
         for item in sorted_work
-        if "assigned" in item.reasons and item.source_type != "pull_request"
+        if "assigned" in item.reasons and item.source_type != "pull_request" and item.status_category != "done" and not item.metadata.get("snapshot_only")
     ]
     my_work: dict[str, list[dict[str, Any]]] = {
         "in_progress": [],
@@ -99,12 +99,16 @@ def build_dashboard(
         group = item.status_category if item.status_category in my_work else "other"
         my_work[group].append(_entry_from_work(item, stale_after_days))
 
-    pull_requests = [item for item in sorted_work if item.source_type == "pull_request"]
+    pull_requests = [item for item in sorted_work if item.source_type == "pull_request" and item.status_category != "done" and not item.metadata.get("snapshot_only")]
     code = {
         "awaiting_review": [
             _entry_from_work(item, stale_after_days)
             for item in pull_requests
-            if "reviewer" in item.reasons
+            if "reviewer" in item.reasons and item.metadata.get("reviewer_vote", 0) == 0 and item.status != "Draft"
+        ],
+        "reviewing": [
+            _entry_from_work(item, stale_after_days)
+            for item in pull_requests if "reviewer" in item.reasons
         ],
         "mine": [
             _entry_from_work(item, stale_after_days)
@@ -136,6 +140,7 @@ def build_dashboard(
         )
 
     return {
+        "tracked_items": [_entry_from_work(item, stale_after_days) for item in sorted_work],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": {
             "assigned": len(assigned),

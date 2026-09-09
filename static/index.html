@@ -2,41 +2,72 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light"><title>Much ADO About Jira</title>
+  <meta name="color-scheme" content="light dark"><title>Much ADO About Jira</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <a class="skip-link" href="#workspace">Skip to work</a>
   <aside class="sidebar">
-    <a class="brand" href="/" aria-label="Much ADO About Jira home"><span class="brand-mark">M</span><span>Much ADO<br><span class="brand-secondary">About Jira</span></span></a>
+    <a class="brand" href="/" aria-label="Much ADO About Jira home"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40"><path class="logo-brackets" d="M12 9H6v22h6M28 9h6v22h-6"/><path class="logo-check" d="m13 20 5 5 10-11"/></svg></span><span>Much ADO<br><span class="brand-secondary">About Jira</span></span></a>
     <div class="nav-label">WORKSPACE</div>
     <nav id="navigation" aria-label="Work views">
-      <button data-view="attention" aria-current="page"><span>Priority inbox</span><span data-count="attention">—</span></button>
+      <button data-view="updates" aria-current="page"><span>Updates</span><span data-count="updates">—</span></button>
       <button data-view="work"><span>My work</span><span data-count="work">—</span></button>
-      <button data-view="code"><span>Pull requests</span><span data-count="code">—</span></button>
-      <button data-view="activity"><span>Activity</span><span data-count="activity">—</span></button>
-      <button data-view="following"><span>Following</span><span data-count="following">—</span></button>
     </nav>
+    <button class="dismissed-link" data-view="dismissed"><span>Dismissed</span><span data-count="dismissed">0</span></button>
     <div class="sidebar-bottom"><span class="local-indicator"></span> Personal workspace<p>Jira + Azure DevOps<br>Source systems are read-only.</p></div>
   </aside>
   <div class="app-shell">
-    <header class="topbar"><span>Engineering <span class="breadcrumb">/</span> <strong>My workspace</strong></span><div class="header-actions"><span id="today"></span><button id="refreshButton" type="button">↻ <span>Refresh</span></button></div></header>
+    <header class="topbar"><span>Engineering <span class="breadcrumb">/</span> <strong>My workspace</strong></span><div class="header-actions"><span id="today"></span><button id="settingsButton" class="theme-toggle" type="button">Settings</button><button id="themeToggle" class="theme-toggle" type="button" aria-pressed="false"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.8 12.1A7 7 0 0 1 7.9 3.2 7 7 0 1 0 16.8 12.1Z"/></svg>Dark mode</button><button id="refreshButton" type="button">↻ <span>Refresh</span></button></div></header>
     <main id="workspace" tabindex="-1">
-      <div class="page-heading"><div><div class="eyebrow">YOUR DAILY WORKSPACE</div><h1 id="viewTitle">Priority inbox</h1><p id="viewDescription">Reviews, replies, and work that needs your next move.</p></div><span class="workspace-label">Personal view</span></div>
-      <section id="summary" class="summary-strip" aria-label="Workspace totals"></section>
-      <section class="source-status" aria-label="Source freshness"><div id="health" aria-live="polite"></div><span id="lastRefresh">Loading source status…</span></section>
+      <div class="page-heading"><div><div class="eyebrow">YOUR DAILY WORKSPACE</div><h1 id="viewTitle">Updates</h1><p id="viewDescription">Catch up on changes. Dismissing an update never hides your work.</p></div><span class="workspace-label">Personal view</span></div>
+      <p id="summary" class="workspace-overview" aria-label="Retrieved workspace overview"></p>
+      <div class="view-context"><p id="coverageSummary" class="workspace-overview"></p><button id="aboutView" class="text-button" type="button">About this view</button></div>
+      <section class="source-status" aria-label="Source freshness"><div id="health" aria-live="polite"></div><button id="syncInfo" class="text-button" type="button">Sync details</button></section>
       <div id="notice" class="notice" role="status" hidden></div>
+      <div id="undoBanner" class="undo-banner" role="status" hidden><span id="undoMessage"></span><button id="undoDismiss" class="text-button">Undo dismissal</button></div>
       <div id="actionNotice" class="notice" role="alert" hidden></div>
       <section class="queue" aria-label="Work queue">
-        <div class="toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="Search title, key, or project…" aria-label="Search current view"><kbd>/</kbd></label><div class="filters"><label class="sr-only" for="sourceFilter">Source</label><select id="sourceFilter"><option value="all">All sources</option><option value="jira">Jira</option><option value="ado">Azure DevOps</option><option value="azure_repos">Azure Repos</option></select><label class="unread-filter"><input id="unreadFilter" type="checkbox"> Unread only</label><button id="clearFilters" class="text-button" hidden>Clear filters</button></div></div>
-        <div class="queue-heading"><h2 id="queueTitle">Next up</h2><span id="resultCount" role="status">Loading…</span></div>
+        <div class="toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="Search title, key, or project…" aria-label="Search current view" title="Search this view. Keyboard shortcut: press / to focus search."></label><div class="filters"><label class="sr-only" for="sourceFilter">Source</label><select id="sourceFilter"><option value="all">All sources</option><option value="jira">Jira</option><option value="ado">Azure DevOps</option><option value="azure_repos">Azure Repos</option></select><label class="sr-only" for="workFilter">Work relationship</label><select id="workFilter" hidden><option value="all">All my work</option><option value="assigned">Assigned to me</option><option value="reviewer">Needs my review</option><option value="my_prs">My pull requests</option><option value="previously_assigned">Previously assigned</option><option value="following">Following</option></select><label id="unreadLabel" class="unread-filter"><input id="unreadFilter" type="checkbox"> Unread only</label><button id="clearFilters" class="text-button" hidden>Clear filters</button></div></div>
+        <div class="queue-heading"><h2 id="queueTitle">Next up</h2><label id="sortLabel" class="sort-label" hidden>Sort <select id="workSort"><option value="status">Status first</option><option value="recent">Recently updated</option><option value="attention">Needs attention first</option></select></label><span id="resultCount" role="status">Loading…</span></div>
+        <p id="readCounts" class="read-counts" role="status"></p><div id="batchBar" class="batch-bar"><label><input type="checkbox" id="selectVisible"> Select displayed rows</label><button id="selectMatching">Select all matching rows</button><button id="clearSelection">Clear selection</button><span id="selectionCount">0 selected</span><button id="batchRead" disabled>Mark read</button><button id="batchUnread" disabled>Mark unread</button></div>
         <div id="workList" aria-busy="true"><div class="loading-state">Loading your workspace…</div></div>
-        <button id="showMore" class="show-more" hidden>Show more</button>
+        <button id="showAllNow" class="show-more">Show all matching rows</button><button id="showMore" class="show-more" hidden>Show more</button>
       </section>
-      <footer><span>Open an item to continue in its source system.</span><span>Seen and dismiss apply only to this workspace.</span></footer>
+      <footer><span>Open an item to continue in its source system.</span><span>Dismiss updates safely. Restore retained entries from Dismissed.</span></footer>
     </main>
   </div>
+  <dialog id="helpDialog" aria-labelledby="helpTitle">
+    <h2 id="helpTitle">About this view</h2><div id="viewGuide"></div>
+    <details id="helpLimits"><summary>Discovery limits</summary><p id="windowDetails"></p></details>
+    <div class="dialog-actions"><button id="closeHelp" type="button">Done</button></div>
+  </dialog>
+  <dialog id="syncDialog" aria-labelledby="syncTitle">
+    <h2 id="syncTitle">Sync details</h2><p id="lastRefresh"></p><p id="historyProgress" hidden></p>
+    <div class="dialog-actions"><button id="closeSync" type="button">Done</button></div>
+  </dialog>
+  <dialog id="settingsDialog" aria-labelledby="settingsTitle">
+    <h2 id="settingsTitle">Settings</h2>
+    <label>Rows per page / Show next <select id="pageSize"><option>30</option><option>50</option><option>100</option><option>250</option></select></label>
+    <label><input id="showAllDefault" type="checkbox"> Show all matching rows by default</label>
+    <p class="dialog-note">Display and group preferences are saved in this browser. Select all matching rows works across pages and collapsed groups.</p>
+    <label><input id="launchAtLogin" type="checkbox" disabled> Launch at Windows sign-in</label>
+    <p class="dialog-note">Enabled by default. Keeps your workspace syncing in the background after you sign in, without opening a browser window. Your computer must be awake.</p>
+    <p id="startupStatus" role="status"></p>
+    <div class="dialog-actions"><button id="closeSettings" type="button">Done</button></div>
+  </dialog>
+  <dialog id="dismissDialog" aria-labelledby="dismissTitle">
+    <form id="dismissForm">
+      <h2 id="dismissTitle">Dismiss updates</h2>
+      <p id="dismissContext"></p>
+      <label><input type="radio" name="scope" value="dismiss" checked> Only this update</label>
+      <label><input type="radio" name="scope" value="dismiss_related"> All current updates for this item</label>
+      <p class="dialog-note">Your work item stays in My work. New updates will still arrive. Undo or restore these updates from Dismissed.</p>
+      <div class="dialog-actions"><button type="button" id="cancelDismiss">Cancel</button><button type="submit">Dismiss</button></div>
+    </form>
+  </dialog>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

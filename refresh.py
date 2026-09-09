@@ -78,6 +78,14 @@ class RefreshCoordinator:
 
     def dashboard(self) -> dict:
         work_items, activities, health = self.store.load()
-        return build_dashboard(
+        dashboard = build_dashboard(
             work_items, activities, health, self.settings.app.stale_after_days
         )
+        dashboard["dismissed"] = self.store.load_dismissed()
+        dashboard['collection_windows'] = {'jira_comment_discovery_enabled': bool(self.settings.jira.activity_projects), 'jira_mentions_days': self.settings.jira.mention_reply_days, 'jira_participation_days': self.settings.jira.participation_days, 'ado_mentions_days': self.settings.azure_devops.mention_reply_days, 'jira_query_cap': self.settings.jira.max_candidates_per_query, 'ado_item_cap': self.settings.azure_devops.max_work_items, 'ado_comment_cap': self.settings.azure_devops.max_comment_candidates}
+        progress = dashboard['health'].get('jira', {}).get('coverage', {}).get('completed_history')
+        if progress:
+            progress['eta_seconds'] = progress['batches_remaining'] * (self.settings.app.refresh_seconds + progress.get('last_sync_seconds', 0))
+        dashboard["stale_after_days"] = self.settings.app.stale_after_days
+        dashboard["activity_retention_days"] = self.settings.app.activity_retention_days
+        return dashboard

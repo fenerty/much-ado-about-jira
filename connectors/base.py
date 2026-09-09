@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -119,3 +120,17 @@ def display_name(value: Any) -> str | None:
 
 def unique_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
+
+
+async def completed_within(coroutines, timeout):
+    """Preserve successful results at the deadline and drain canceled tasks."""
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    if not tasks:
+        return []
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        return [task.result() for task in tasks if task in done and not task.cancelled() and task.exception() is None]
+    finally:
+        for task in tasks:
+            if not task.done(): task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

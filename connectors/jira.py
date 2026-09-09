@@ -39,6 +39,8 @@ class JiraConnector:
             message = "Jira refreshed successfully"
             if partial:
                 message = "Jira refreshed with some unavailable query paths"
+                if set(partial_queries) == {"closed_history:rotating_batch"}:
+                    message = "Jira refreshed; completed-ticket history refreshes in rotating batches of 16"
             return ConnectorResult(
                 connector=self.name,
                 work_items=items,
@@ -50,12 +52,16 @@ class JiraConnector:
                     last_attempt_at=attempted,
                     last_success_at=utc_now(),
                     coverage={
+                        "completed_history": {**getattr(self, "_history_progress", {}), "last_sync_seconds": (utc_now() - attempted).total_seconds()},
                         "site": self.settings.site,
                         "work_items": len(items),
                         "activity_projects": list(self.settings.activity_projects),
+                        "comment_discovery_enabled": bool(self.settings.activity_projects),
                         "structured_mentions": mention_capability,
                         "unavailable_queries": partial_queries,
                         "notification_inbox": "unsupported",
+                        "previous_assignment_query": "previously_assigned" not in partial_queries,
+                        "historical_coverage": "Partial: comment discovery is bounded by configured projects and lookback windows",
                     },
                 ),
             )
@@ -170,14 +176,22 @@ class JiraConnector:
                 identity["account_id"] = str(assignee.get("accountId") or "")
 
         queries = {
-            "watching": "watcher = currentUser() AND statusCategory != Done ORDER BY updated DESC",
-            "author": "(creator = currentUser() OR reporter = currentUser()) AND statusCategory != Done ORDER BY updated DESC",
+            "assigned:completed": "assignee = currentUser() AND statusCategory = Done ORDER BY updated DESC",
+            "previously_assigned": "assignee WAS currentUser() AND (assignee != currentUser() OR assignee IS EMPTY) ORDER BY updated DESC",
+            "watching": "watcher = currentUser() ORDER BY updated DESC",
+            "author": "(creator = currentUser() OR reporter = currentUser()) ORDER BY updated DESC",
         }
+        # Give each relationship an independent active-work budget. Closed
+        # history must never displace an older open item in a capped result.
+        for role in ('previously_assigned', 'watching', 'author'):
+            base = queries[role].removesuffix(' ORDER BY updated DESC')
+            queries[role] = f'({base}) AND statusCategory != Done ORDER BY updated DESC'
+            queries[f'{role}:completed'] = f'({base}) AND statusCategory = Done ORDER BY updated DESC'
         failed: list[str] = []
         if len(assigned) >= self.settings.max_candidates_per_query:
             failed.append("assigned:safety_limit")
         account_id = identity.get("account_id", "")
-        if account_id:
+        if account_id and self.settings.activity_projects:
             queries["participant_candidate"] = (
                 f'project IN ({projects}) AND issue IN updatedBy("{account_id}", '
                 f'"-{self.settings.participation_days}d") ORDER BY updated DESC'
@@ -186,7 +200,7 @@ class JiraConnector:
                 f'project IN ({projects}) AND comment ~ "{account_id}" '
                 f'AND updated >= -{self.settings.mention_reply_days}d ORDER BY updated DESC'
             )
-        else:
+        elif self.settings.activity_projects:
             failed.extend(["participant_candidate:no_account_id", "mention_candidate:no_account_id"])
 
         async def query(role: str, jql: str) -> tuple[str, list[dict[str, Any]] | None]:
@@ -208,7 +222,7 @@ class JiraConnector:
                 if not key:
                     continue
                 records[key] = row
-                roles.setdefault(key, set()).add(role)
+                roles.setdefault(key, set()).add(role.split(":", 1)[0])
         return records, roles, failed
 
     def _search(self, executable: str | CommandSpec, jql: str) -> list[dict[str, Any]]:
@@ -242,13 +256,36 @@ class JiraConnector:
                     return key, None
                 return key, row
 
+        # ACLI search cannot return timestamps. Rotate a bounded completed-item
+        # batch so historical detail cannot starve active-work refreshes.
+        closed = []
+        candidates = []
+        for key, row in records.items():
+            fields = row.get('fields') or row
+            status = fields.get('status') or {}
+            name = str(status.get('name') or '') if isinstance(status, dict) else str(status)
+            category = str((status.get('statusCategory') or {}).get('name') or '') if isinstance(status, dict) else ''
+            if self._status_category(name, category) == 'done':
+                closed.append(key)
+            else:
+                candidates.append(key)
+        closed.sort()
+        checked = getattr(self, '_history_checked', set()) & set(closed)
+        if closed and len(checked) == len(closed):
+            checked = set()
+        batch = [key for key in closed if key not in checked][:16]
+        candidates.extend(batch)
         hydrated: dict[str, dict[str, Any]] = {}
-        failures: list[str] = []
-        for key, row in await asyncio.gather(*(hydrate(key) for key in records)):
+        failures: list[str] = ['closed_history:rotating_batch'] if len(closed) > len(batch) else []
+        for key, row in await asyncio.gather(*(hydrate(key) for key in candidates)):
             if row is None:
                 failures.append(f"view:{key}")
             else:
                 hydrated[key] = row
+        checked.update(key for key in batch if key in hydrated)
+        self._history_checked = checked
+        remaining = len(closed) - len(checked)
+        self._history_progress = {'total': len(closed), 'checked': len(checked), 'remaining': remaining, 'batches_remaining': (remaining + 15) // 16, 'failed': sum(key not in hydrated for key in batch)}
         return hydrated, failures
 
     def _view(self, executable: str | CommandSpec, key: str) -> dict[str, Any]:
@@ -312,7 +349,7 @@ class JiraConnector:
             assignee = fields.get("assignee") or {}
             if "assigned" in roles and isinstance(assignee, dict) and not identity.get("account_id"):
                 identity["account_id"] = str(assignee.get("accountId") or "")
-            reasons = [role for role in ("assigned", "watching", "author") if role in roles]
+            reasons = [role for role in ("assigned", "watching", "author", "previously_assigned") if role in roles]
             if "author" in roles:
                 reasons.append("waiting")
             title = str(fields.get("summary") or key)
@@ -353,8 +390,7 @@ class JiraConnector:
                 reasons=unique_strings(reasons),
                 metadata={"status_category_source": category_name or "derived"},
             )
-            if category != "done" or bool({"mentioned", "replied", "participant"} & set(reasons)):
-                items.append(item)
+            items.append(item)
             activities.append(
                 Activity(
                     id=f"jira:issue:{key}:updated:{updated.isoformat()}",
