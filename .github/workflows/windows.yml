@@ -23,4 +23,3 @@ jobs:
           path: |
             dist/MuchADOAboutJira-Windows-x64.zip
             dist/SHA256SUMS.txt
-
