@@ -25,3 +25,8 @@ settings.toml
 .auth/
 .playwright/
 artifacts/
+
+# Generated distributables
+build/
+dist/
+*.spec

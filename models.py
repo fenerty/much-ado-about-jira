@@ -47,6 +47,8 @@ class Activity(BaseModel):
     item_title: str
     timestamp: datetime
     summary: str
+    changes: list[str] = Field(default_factory=list)
+    detail_source: str | None = None
     url: str
     reasons: list[str] = Field(default_factory=list)
     unread: bool = False

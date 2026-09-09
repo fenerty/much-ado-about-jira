@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
+from activity_details import snapshot_changes
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 
 
@@ -80,9 +81,36 @@ class Store:
                 "UPDATE entities SET active = 0 WHERE connector = ? AND entity_kind = 'work_item'",
                 (result.connector,),
             )
+            previous_items = {
+                row['entity_id']: json.loads(row['payload_json'])
+                for row in connection.execute("SELECT entity_id, payload_json FROM entities WHERE connector = ? AND entity_kind = 'work_item'", (result.connector,))
+            }
+            for item in result.work_items:
+                previous = previous_items.get(item.id, {})
+                historical = set(previous.get('metadata', {}).get('tracked_relationships', [])) | set(previous.get('reasons', [])) | set(item.reasons)
+                item.metadata['tracked_relationships'] = sorted(historical)
+                if 'assigned' in historical and 'assigned' not in item.reasons and 'previously_assigned' not in item.reasons:
+                    item.reasons.append('previously_assigned')
+            current_items = {item.id: item.model_dump(mode='json') for item in result.work_items}
             for item in result.work_items:
                 self._upsert_entity(connection, result.connector, "work_item", item, item.updated_at, now)
             for activity in result.activities:
+                if activity.item_id not in previous_items and activity.item_id not in current_items:
+                    parent = WorkItem(id=activity.item_id, source=activity.source, source_type='unknown', project='', key=activity.item_key, title=activity.item_title, url=activity.url, status='Unknown', updated_at=activity.timestamp, reasons=activity.reasons, metadata={'discovered_from_update': True})
+                    self._upsert_entity(connection, result.connector, 'work_item', parent, parent.updated_at, now)
+                    connection.execute('UPDATE entities SET active = 0 WHERE entity_id = ?', (parent.id,))
+                    previous_items[parent.id] = parent.model_dump(mode='json')
+                if activity.event_type == 'updated' and not activity.changes:
+                    existing = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity'", (activity.id,)).fetchone()
+                    saved = json.loads(existing['payload_json']) if existing else {}
+                    if saved.get('changes'):
+                        activity = activity.model_copy(update={key: saved.get(key) for key in ('changes', 'detail_source', 'summary', 'actor')})
+                    elif activity.item_id in previous_items and activity.item_id in current_items:
+                        before, after = previous_items[activity.item_id], current_items[activity.item_id]
+                        if before.get('updated_at') != after.get('updated_at'):
+                            changes = snapshot_changes(before, after)
+                            if changes:
+                                activity = activity.model_copy(update={'changes': changes, 'detail_source': 'Between local refreshes', 'summary': '; '.join(changes)})
                 self._upsert_entity(
                     connection, result.connector, "activity", activity, activity.timestamp, now
                 )
@@ -176,7 +204,7 @@ class Store:
                 SELECT e.*, s.seen_version, s.dismissed_version
                 FROM entities e
                 LEFT JOIN local_state s ON s.entity_id = e.entity_id
-                WHERE e.active = 1
+                WHERE e.active = 1 OR e.entity_kind = 'work_item'
                 ORDER BY e.event_at DESC
                 """
             ).fetchall()
@@ -192,19 +220,84 @@ class Store:
             data = json.loads(row["payload_json"])
             data["unread"] = row["seen_version"] != row["version_hash"]
             if row["entity_kind"] == "work_item":
+                data['metadata']['snapshot_only'] = not bool(row['active'])
+                data['metadata']['last_verified_at'] = row['last_seen_at']
                 work_items.append(WorkItem.model_validate(data))
             else:
                 activities.append(Activity.model_validate(data))
         health = [ConnectorHealth.model_validate_json(row["health_json"]) for row in health_rows]
         return work_items, activities, health
 
-    def set_local_state(self, entity_id: str, action: Literal["seen", "dismiss"]) -> bool:
+    def load_dismissed(self) -> list[dict]:
+        """Only retained, active entries hidden at their current version."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute("""
+                SELECT e.payload_json, e.entity_kind, s.updated_at
+                FROM entities e JOIN local_state s ON s.entity_id = e.entity_id
+                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND e.version_hash = s.dismissed_version
+                ORDER BY s.updated_at DESC
+            """).fetchall()
+        return [{**json.loads(row['payload_json']), 'entity_kind': row['entity_kind'],
+                 'dismissed_at': row['updated_at']} for row in rows]
+
+    def dismiss_updates(self, entity_id: str, all_for_item: bool = False) -> list[dict]:
+        """Hide existing update events, never their parent item or future updates."""
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            target = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity' AND active = 1", (entity_id,)).fetchone()
+            if not target:
+                return []
+            item_id = json.loads(target['payload_json'])['item_id']
+            rows = connection.execute("""SELECT e.entity_id, e.version_hash, e.payload_json
+                FROM entities e LEFT JOIN local_state s ON s.entity_id = e.entity_id
+                WHERE e.entity_kind = 'activity' AND e.active = 1
+                AND (s.dismissed_version IS NULL OR s.dismissed_version != e.version_hash)""").fetchall()
+            undo = []
+            for row in rows:
+                if row['entity_id'] != entity_id and not (all_for_item and json.loads(row['payload_json'])['item_id'] == item_id):
+                    continue
+                connection.execute("""INSERT INTO local_state(entity_id, dismissed_version, updated_at)
+                    VALUES(?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET
+                    dismissed_version = excluded.dismissed_version, updated_at = excluded.updated_at""",
+                    (row['entity_id'], row['version_hash'], utc_now().isoformat()))
+                undo.append({'entity_id': row['entity_id'], 'version': row['version_hash']})
+            return undo
+
+    def restore_dismissed(self, entries: list[dict]) -> None:
+        """Undo only the versions hidden by that action, preserving seen state."""
+        with self._lock, self._connect() as connection:
+            for entry in entries:
+                connection.execute("""UPDATE local_state SET dismissed_version = NULL
+                    WHERE entity_id = ? AND dismissed_version = ?""",
+                    (entry['entity_id'], entry['version']))
+
+    def mark_batch(self, entity_ids: list[str], action: str) -> int:
+        """Change only the selected entities' read state; preserve dismissal."""
+        with self._lock, self._connect() as connection:
+            count = 0
+            for entity_id in set(entity_ids):
+                row = connection.execute('SELECT version_hash FROM entities WHERE entity_id = ?', (entity_id,)).fetchone()
+                if row is None:
+                    continue
+                connection.execute('''INSERT INTO local_state(entity_id, seen_version, updated_at)
+                    VALUES(?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET
+                    seen_version = excluded.seen_version, updated_at = excluded.updated_at''',
+                    (entity_id, row['version_hash'] if action == 'seen' else None, utc_now().isoformat()))
+                count += 1
+            return count
+
+    def set_local_state(self, entity_id: str, action: Literal["seen", "unread", "dismiss", "restore"]) -> bool:
+        if action in {'seen', 'unread'}:
+            return bool(self.mark_batch([entity_id], action))
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                "SELECT version_hash FROM entities WHERE entity_id = ? AND active = 1", (entity_id,)
+                "SELECT version_hash FROM entities WHERE entity_id = ? AND (active = 1 OR entity_kind = 'work_item')", (entity_id,)
             ).fetchone()
             if row is None:
                 return False
+            if action == 'restore':
+                connection.execute('UPDATE local_state SET dismissed_version = NULL WHERE entity_id = ?', (entity_id,))
+                return True
             now = utc_now().isoformat()
             dismissed = row["version_hash"] if action == "dismiss" else None
             connection.execute(

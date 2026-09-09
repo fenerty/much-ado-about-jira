@@ -4,7 +4,7 @@ from models import Activity, ConnectorHealth, ConnectorResult, WorkItem
 from store import Store
 
 
-NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc) - timedelta(days=1)
 
 
 def make_item(status="Active", updated=NOW):

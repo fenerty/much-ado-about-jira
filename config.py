@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 import glob
 from dataclasses import dataclass, field
@@ -57,6 +58,8 @@ class Settings:
 
 
 def _default_state_dir() -> Path:
+    if os.environ.get("MUCH_ADO_STATE_DIR"):
+        return Path(os.environ["MUCH_ADO_STATE_DIR"])
     local_app_data = os.environ.get("LOCALAPPDATA")
     base = Path(local_app_data) if local_app_data else Path.home() / ".local" / "share"
     package_local = glob.glob(
@@ -72,9 +75,16 @@ def _section(data: dict, name: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def user_config_path() -> Path:
+    configured = os.environ.get('MUCH_ADO_CONFIG')
+    if configured:
+        return Path(configured)
+    return (_default_state_dir() if getattr(sys, 'frozen', False) else PROJECT_ROOT) / 'settings.toml'
+
+
 def load_settings(path: Path | None = None) -> Settings:
     configured = os.environ.get("MUCH_ADO_CONFIG")
-    config_path = path or (Path(configured) if configured else PROJECT_ROOT / "settings.toml")
+    config_path = path or user_config_path()
     if not config_path.exists() and not path and not configured:
         config_path = PROJECT_ROOT / "settings.example.toml"
     with config_path.open("rb") as handle:

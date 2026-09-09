@@ -1,0 +1,32 @@
+Much ADO About Jira - Windows quick start
+
+1. Extract the entire ZIP to a permanent folder, such as Documents\MuchADOAboutJira.
+2. Double-click MuchADOAboutJira.exe. Keep the _internal folder beside it.
+3. Enter your work email, Jira site and/or Azure organization in the setup form.
+4. Click Install tools, sign in, and open dashboard. Complete browser sign-in.
+
+No Python, Git, fork, or GitHub account is required. Setup downloads official
+source tools, which need an internet connection and additional disk space.
+Your company may require IT approval for these tools or account access.
+
+This preview is not code-signed. Windows may display an unknown-publisher
+warning. Verify the download comes from fenerty/much-ado-about-jira; follow
+your organization's software policy. Do not disable Windows security.
+
+The dashboard opens in your default browser at http://127.0.0.1:8765.
+Source systems are read-only. Account configuration and cached work stay in
+your Windows user-local application data, not in this download.
+Settings -> Launch at Windows sign-in is enabled by default. It starts quietly
+without opening your browser. Double-click the app when you want to view it.
+Disable this setting before moving/removing the extracted app folder.
+
+To update, disable launch at sign-in, stop the app process using Windows Task
+Manager, replace the extracted app folder, launch the new version, then enable
+launch at sign-in again. Your user-local work data is preserved.
+
+Troubleshooting: Re-run the app after sign-in/network issues. If setup fails,
+retry the setup form. Existing users can open the source using its normal
+browser site; the dashboard never replaces the source system.
+
+Source and issue reports: https://github.com/fenerty/much-ado-about-jira
+Do not attach screenshots, settings, logs, or exports containing company data.

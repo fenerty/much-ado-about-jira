@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 import httpx
 
+from activity_details import ado_changes
 from config import AzureDevOpsSettings
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_ado_read_operation, safe_error
@@ -29,6 +30,7 @@ class AzureDevOpsConnector:
     def __init__(self, settings: AzureDevOpsSettings, timeout_seconds: int):
         self.settings = settings
         self.timeout_seconds = timeout_seconds
+        self._history_cache = {}
 
     async def refresh(self) -> ConnectorResult:
         attempted = utc_now()
@@ -54,9 +56,9 @@ class AzureDevOpsConnector:
                 activities.extend(pr_activity)
 
             message = "Azure DevOps refreshed successfully"
-            state = "partial" if pr_partial else "ok"
-            if pr_partial:
-                message = "Azure DevOps refreshed with bounded PR project coverage"
+            state = "partial" if pr_partial or self._work_partial else "ok"
+            if pr_partial or self._work_partial:
+                message = "Azure DevOps refreshed with incomplete work-item or PR coverage"
             return ConnectorResult(
                 connector=self.name,
                 work_items=work_items,
@@ -74,6 +76,8 @@ class AzureDevOpsConnector:
                         "pull_requests": len(pr_items),
                         "projects_considered": len(projects),
                         "pull_request_query_scope": "organization",
+                        "historical_coverage": "Partial: prior assignment queried; comments limited to discovered items; subscriptions not collected",
+                        "work_query_incomplete": self._work_partial,
                     },
                 ),
             )
@@ -288,12 +292,24 @@ class AzureDevOpsConnector:
     async def _work_items(
         self, client: httpx.AsyncClient, identity: dict[str, Any]
     ) -> tuple[list[WorkItem], list[Activity], list[dict[str, Any]]]:
-        assigned_ids, authored_ids, projects = await asyncio.gather(
+        self._work_partial = False
+        async def past_assignments():
+            try:
+                return await self._wiql(client, 'EVER [System.AssignedTo] = @Me')
+            except Exception:
+                self._work_partial = True
+                return []
+        assigned_ids, authored_ids, projects, previous_ids = await asyncio.gather(
             self._wiql(client, "[System.AssignedTo] = @Me"),
             self._wiql(client, "[System.CreatedBy] = @Me"),
             self._projects(client),
+            past_assignments(),
         )
-        all_ids = list(dict.fromkeys(assigned_ids + authored_ids))[: self.settings.max_work_items]
+        combined_ids = list(dict.fromkeys(assigned_ids + authored_ids + previous_ids))
+        if len(combined_ids) > self.settings.max_work_items or any(len(ids) >= self.settings.max_work_items for ids in (assigned_ids, authored_ids, previous_ids)):
+            self._work_partial = True
+        all_ids = combined_ids[: self.settings.max_work_items]
+        previous_set = set(previous_ids)
         records = await self._hydrate(client, all_ids)
         categories = await self._state_categories(client, records)
         assigned_set, authored_set = set(assigned_ids), set(authored_ids)
@@ -317,14 +333,14 @@ class AzureDevOpsConnector:
                     category = "in_progress"
                 elif any(word in state_lower for word in ("new", "ready", "proposed", "to do")):
                     category = "todo"
-            if category == "done":
-                continue
             tags = str(fields.get("System.Tags") or "")
-            if "blocked" in state.lower() or "blocked" in tags.lower():
+            if category != "done" and ("blocked" in state.lower() or "blocked" in tags.lower()):
                 category = "blocked"
             reasons: list[str] = []
             if work_id in assigned_set:
                 reasons.append("assigned")
+            if work_id in previous_set and work_id not in assigned_set:
+                reasons.append("previously_assigned")
             if work_id in authored_set:
                 reasons.extend(["author", "waiting"])
             updated = parse_datetime(fields.get("System.ChangedDate")) or utc_now()
@@ -367,6 +383,40 @@ class AzureDevOpsConnector:
             if updated >= cutoff and int(fields.get("System.CommentCount") or 0) > 0:
                 candidates.append((item, record))
 
+        # Bounded, best-effort field history for the latest recent work-item revision.
+        by_id = {str(record.get('id')): record for record in records}
+        history_targets = [item for item in items if item.updated_at >= utc_now() - timedelta(days=self.settings.mention_reply_days)][:50]
+        history_semaphore = asyncio.Semaphore(6)
+        async def history(item):
+            async with history_semaphore:
+                revision = int(by_id.get(item.key, {}).get('rev') or 0)
+                if not revision:
+                    return None
+                cache_key = (item.id, revision)
+                if cache_key in self._history_cache:
+                    return self._history_cache[cache_key]
+                data, _ = await self._json(client, 'GET', f"{self.base_url}/_apis/wit/workItems/{item.key}/updates?$top=2&$skip={max(0, revision - 2)}&api-version={API_VERSION}")
+                update = next((value for value in data.get('value', []) if value.get('rev') == revision), None)
+                if not update:
+                    return None
+                changes = ado_changes(update)
+                result = (item.id, changes, display_name(update.get('revisedBy')))
+                if len(self._history_cache) >= 500:
+                    self._history_cache.clear()
+                self._history_cache[cache_key] = result
+                return result
+        try:
+            history_results = await asyncio.wait_for(asyncio.gather(*(history(item) for item in history_targets), return_exceptions=True), timeout=5)
+        except TimeoutError:
+            history_results = []
+        for result in history_results:
+            if isinstance(result, tuple) and result[1]:
+                for activity in activities:
+                    if activity.item_id == result[0] and activity.event_type == 'updated':
+                        activity.changes = result[1]
+                        activity.summary = '; '.join(result[1])
+                        activity.detail_source = 'ADO revision history'
+                        activity.actor = result[2]
         candidates = candidates[: self.settings.max_comment_candidates]
         semaphore = asyncio.Semaphore(6)
 
