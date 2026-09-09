@@ -26,7 +26,7 @@ Current and previous assignments, authored work, followed/watched items, and wor
 
 The next coverage milestone is a durable relationship registry plus bounded backfill and incremental polling. It must preserve known involvement, distinguish closed work from deleted/unavailable work, and report what is and is not collected. Do not claim full historical coverage before validating it.
 
-Read/unread is local per entity and batch actions affect only selected displayed rows. It never dismisses entries or propagates between work and events.
+Mark read is linked across views: selected updates read their parent work items; selected work items read all currently retained updates. Expand only from explicitly selected work, so an update does not recursively read its siblings. Mark unread stays local to selected rows. Dismissal state and future unread changes are preserved.
 
 Jira completed detail refresh rotates through 16 discovered closed tickets per refresh; active candidates refresh each time. Search caps still apply. Partial coverage remains explicit during rotation.
 

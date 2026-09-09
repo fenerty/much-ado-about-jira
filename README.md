@@ -88,7 +88,7 @@ Settings → Launch at Windows sign-in is enabled on first launch. It registers 
 
 ## Display, selection, and coverage
 
-Settings saves 30/50/100/250 rows per page or Show all by default in your browser. Select all matching rows includes undisplayed pages and collapsed groups, with an explicit selected count. Read/unread changes only those entities. Status groups can be collapsed and reordered with accessible arrow controls; these preferences persist per browser.
+Settings saves 30/50/100/250 rows per page or Show all by default in your browser. Select all matching rows includes undisplayed pages and collapsed groups, with an explicit selected count. Mark read links both views: selecting an update also reads its parent work item; selecting a work item reads all its currently retained updates. Reading one update does not read its sibling updates. Mark unread affects only explicitly selected rows. These actions preserve dismissal state and never mark future changes read. Status groups can be collapsed and reordered with accessible arrow controls; these preferences persist per browser.
 
 My work has no age cutoff after discovery. Updates retains captured events for 60 days by default, not every historical source event. The UI reports distinct parent-item counts and the configured discovery windows/caps beside the view. Consequently My work can have more entries than Updates.
 

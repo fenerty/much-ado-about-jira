@@ -14,8 +14,8 @@ const views = {
   dismissed: ["Dismissed", "Bring back retained updates or items you previously hid.", "Restore an entry"],
 };
 const viewGuides = {
-  updates: ["What changed?", "One row per captured change, comment, mention, or reply. A ticket can have several updates—or none in the retained window.", "Read/unread affects only the selected rows. Dismiss hides updates, never their ticket or future updates. Undo or Dismissed brings back retained updates."],
-  work: ["What am I keeping track of?", "One row per discovered ticket or PR related to you: assigned now or previously, created, followed, or discussed. It stays here after handoff or completion; there is no age cutoff after discovery.", "Status badges use the source’s wording. Groups help organize the list; reading an item does not clear its updates. Last known means the latest sync did not retrieve that item, so its status may have changed."],
+  updates: ["What changed?", "One row per captured change, comment, mention, or reply. A ticket can have several updates—or none in the retained window.", "Mark read also reads the matching My work item; other updates stay unread. Mark unread affects only the selected rows. Dismiss hides updates, never their ticket or future updates; Undo or Dismissed restores retained updates."],
+  work: ["What am I keeping track of?", "One row per discovered ticket or PR related to you: assigned now or previously, created, followed, or discussed. It stays here after handoff or completion; there is no age cutoff after discovery.", "Status badges use the source’s wording. Mark read also reads all current updates for that item. Mark unread affects only the selected rows. New updates still arrive unread. Last known means the latest sync did not retrieve that item, so its status may have changed."],
   dismissed: ["What did I hide?", "Updates you dismissed, plus items hidden with the old interface. Restore brings back that row and preserves its read state.", "Dismissal never stops future updates. If a restored update is read, turn off Unread only in Updates to see it."],
 };
 function rememberView() {

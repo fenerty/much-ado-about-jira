@@ -272,19 +272,35 @@ class Store:
                     (entry['entity_id'], entry['version']))
 
     def mark_batch(self, entity_ids: list[str], action: str) -> int:
-        """Change only the selected entities' read state; preserve dismissal."""
+        """Read an event plus its parent, or selected work plus its current events.
+
+        Expand from the original selection only: reading one event must not
+        recursively read its siblings. Unread remains an explicit row action.
+        """
         with self._lock, self._connect() as connection:
-            count = 0
-            for entity_id in set(entity_ids):
-                row = connection.execute('SELECT version_hash FROM entities WHERE entity_id = ?', (entity_id,)).fetchone()
-                if row is None:
-                    continue
+            connection.execute('BEGIN IMMEDIATE')
+            rows = connection.execute('SELECT entity_id, entity_kind, version_hash, payload_json FROM entities').fetchall()
+            by_id = {row['entity_id']: row for row in rows}
+            selected = set(entity_ids) & by_id.keys()
+            targets = set(selected)
+            if action == 'seen':
+                selected_work = {entity_id for entity_id in selected if by_id[entity_id]['entity_kind'] == 'work_item'}
+                for entity_id in selected:
+                    row = by_id[entity_id]
+                    if row['entity_kind'] == 'activity':
+                        parent_id = json.loads(row['payload_json'])['item_id']
+                        if parent_id in by_id and by_id[parent_id]['entity_kind'] == 'work_item':
+                            targets.add(parent_id)
+                for row in rows:
+                    if row['entity_kind'] == 'activity' and json.loads(row['payload_json'])['item_id'] in selected_work:
+                        targets.add(row['entity_id'])
+            now = utc_now().isoformat()
+            for entity_id in targets:
                 connection.execute('''INSERT INTO local_state(entity_id, seen_version, updated_at)
                     VALUES(?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET
                     seen_version = excluded.seen_version, updated_at = excluded.updated_at''',
-                    (entity_id, row['version_hash'] if action == 'seen' else None, utc_now().isoformat()))
-                count += 1
-            return count
+                    (entity_id, by_id[entity_id]['version_hash'] if action == 'seen' else None, now))
+            return len(selected)
 
     def set_local_state(self, entity_id: str, action: Literal["seen", "unread", "dismiss", "restore"]) -> bool:
         if action in {'seen', 'unread'}:
