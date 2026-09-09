@@ -88,3 +88,21 @@ def acquire_instance(port=8765):
         kernel.CloseHandle(handle)
         return None
     return handle
+
+
+def listener_identity(host, port):
+    """Never open an unrelated service just because it owns our port."""
+    import socket
+    import json
+    from urllib.request import build_opener, ProxyHandler
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            pass
+    except OSError:
+        return 'none'
+    try:
+        with build_opener(ProxyHandler({})).open(f'http://{host}:{port}/api/identity', timeout=2) as response:
+            data = json.loads(response.read(2048))
+        return 'ours' if data == {'application': 'much-ado-about-jira'} else 'other'
+    except (OSError, ValueError):
+        return 'other'

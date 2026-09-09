@@ -985,3 +985,24 @@ dialog label { display: block; font-size: 13px; padding: 10px 0; }
 .status-group { display:flex; justify-content:space-between; gap:12px; }
 .status-group button { color:inherit; font:inherit; font-weight:600; background:transparent; border:0; cursor:pointer; padding:4px 8px; }
 .status-group button:disabled { opacity:.3; }
+
+/* A quieter workspace with clearer reading hierarchy. */
+.view-context { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:14px; }
+.view-context .workspace-overview { margin:0; }
+.row-title { font-size:15px; line-height:1.5; font-weight:500; }
+.row-meta,.row-key,.age,.detail-source { font-size:12px; }
+.row-meta { row-gap:8px; line-height:1.5; }
+.row-action-button,.source-badge,.reason-badge,.event-label { font-size:12px; }
+.search input,.filters select,.unread-filter,.batch-bar,.read-counts,.workspace-overview { font-size:13px; }
+.work-row { padding-top:20px; padding-bottom:20px; }
+.work-row.unread { background:#edf4ff; box-shadow:inset 4px 0 #356ecb; }
+.work-row.unread:hover { background:#e5efff; }
+.unread .row-title { font-weight:700; }
+.unread .read-label { color:#174c9d; background:#d5e5ff; padding:3px 5px; border-radius:4px; font-size:11px; }
+[data-theme="dark"] .work-row.unread { background:#1b3049; box-shadow:inset 4px 0 #85b6ff; }
+[data-theme="dark"] .work-row.unread:hover { background:#213b59; }
+[data-theme="dark"] .unread .read-label { color:#e2eeff; background:#2a4d78; }
+#helpDialog { width:min(620px, calc(100vw - 32px)); }
+#helpDialog details { font-size:13px; color:var(--muted); line-height:1.7; }
+#helpDialog details p { margin-top:12px; }
+#helpDialog p:empty { display:none; }

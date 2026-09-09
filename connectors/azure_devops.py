@@ -17,7 +17,7 @@ from activity_details import ado_changes
 from config import AzureDevOpsSettings
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_ado_read_operation, safe_error
-from .base import CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
+from .base import completed_within, CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
 
 
 ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
@@ -405,10 +405,7 @@ class AzureDevOpsConnector:
                     self._history_cache.clear()
                 self._history_cache[cache_key] = result
                 return result
-        try:
-            history_results = await asyncio.wait_for(asyncio.gather(*(history(item) for item in history_targets), return_exceptions=True), timeout=5)
-        except TimeoutError:
-            history_results = []
+        history_results = await completed_within((history(item) for item in history_targets), timeout=5)
         for result in history_results:
             if isinstance(result, tuple) and result[1]:
                 for activity in activities:

@@ -31,3 +31,5 @@ Read/unread is local per entity and batch actions affect only selected displayed
 Jira completed detail refresh rotates through 16 discovered closed tickets per refresh; active candidates refresh each time. Search caps still apply. Partial coverage remains explicit during rotation.
 
 Display preferences support 30/50/100/250 rows or all rows. Explicit all-matching selection includes collapsed groups and undisplayed pages. Group order and collapsed state persist per browser. Coverage counts distinguish retained events, distinct event parents, durable work, and bounded discovery; rotating history progress is per process/session pass, with ETA withheld on failed checks.
+
+Keep explanations contextual: one About popout per view, optional discovery details, routine progress under Sync details, and visible actionable sync failures. Preserve view filters, shown-row count, group preferences, selections, and last view across navigation/reload. Explicit Clear filters and Clear selection are the ways to reset those choices.

@@ -11,7 +11,7 @@ There are two work views:
 
 The **Dismissed** utility restores retained hidden entries, including work items dismissed by older versions. Dismiss offers an explicit choice: only this update, or all current updates for its item. It never mutes future updates or writes to source systems. An immediate Undo action restores that dismissal; Dismissed remains available after reloading. New dismissals preserve unread state. Older dismissals may have already marked entries seen, so restored updates may require turning off Unread only. Activity that expired under the configured retention policy cannot be restored.
 
-Use the **Dark mode** toggle for a low-glare graphite theme. The app follows your system theme until you choose; your choice is saved in this browser. Search by title, key, or project, filter by source, or press `/` to focus search. Switching views resets the filters so a previous view's search cannot silently hide work. The collapsible **What belongs here?** guide explains each view. Source status shows freshness and partial coverage.
+Use the **Dark mode** toggle for a low-glare graphite theme. The app follows your system theme until you choose; your choice is saved in this browser. Search by title, key, or project, filter by source, or press `/` to focus search. Each view remembers its filters, shown-row count, and selections across navigation and reload. **About Updates/My work** opens a concise, view-specific guide with optional discovery details. Source status shows freshness and partial coverage.
 
 This is a personal workspace for individual engineers, not a shared team database. Each user runs their own instance with their own source permissions.
 
@@ -104,3 +104,5 @@ Use a feature branch and pull request; keep company data and local settings out 
 ```
 
 The package explicitly includes only application assets and generic setup files. Builds use [PyInstaller's one-folder Windows packaging](https://pyinstaller.org/en/stable/usage.html). Generated packages, tool downloads, databases, and personal configuration are ignored by Git. Release artifacts include SHA-256 checksums. A clean-machine first-run sign-in is a separate validation step from offline tests and package launch tests.
+
+Unread rows use a distinct background, accent edge, and label. No recent changes means the last retrieved source update exceeds the configured aging threshold (30 days by default), not overdue work or a sync failure. Routine history progress is available in Sync details.

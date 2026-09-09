@@ -14,10 +14,28 @@ const views = {
   dismissed: ["Dismissed", "Bring back retained updates or items you previously hid.", "Restore an entry"],
 };
 const viewGuides = {
-  updates: ["Start here when you want to catch up.", "Each row is an update, comment, mention, or reply. Unread only is on initially; turn it off to include updates you have seen. Multiple updates can belong to one item.", "Open an update for source context, mark it seen, or choose Dismiss to hide this update or all current updates for its item. New updates will still arrive. ADO revision history is source-confirmed; Between local refreshes is an observed comparison, not full history."],
-  work: ["Come here when you want to decide what to work on.", "Assignments, previously assigned work, pull requests, and followed work are combined into one list, grouped by status: blocked/on hold, in progress, validation/review, waiting, scheduled, to do, then completed. Within each group, latest changes come first. Exact source statuses appear in colored badges; these are workflow states, not separate board swimlanes. Open PRs includes your authored PRs; Needs my review means you are a reviewer who has not voted on a non-draft PR. Use the relationship filter for assignments, review requests, your PRs, or following.", "Look for Review requested, Blocked, failed checks, and open threads. Open the item to act in its source system. Read/unread applies to the selected row only: marking work read does not clear its updates, and marking an update read does not clear other updates. Tracked items stay here after closure or query omission; omitted items show a last-known-status label. There is no dismiss action here; clearing updates does not clear work."],
-  dismissed: ["Restore something you dismissed without waiting for another change.", "This contains retained dismissed updates and any work items hidden using the old interface. Restoring a work item brings it back to its eligible work lists; restoring an update brings back that event only.", "Select Restore. New dismissals preserve the prior unread state; older dismissals may already have marked an entry seen. Restored seen updates are available with Unread only turned off. Expired activity cannot be recovered here."],
+  updates: ["What changed?", "One row per captured change, comment, mention, or reply. A ticket can have several updates—or none in the retained window.", "Read/unread affects only the selected rows. Dismiss hides updates, never their ticket or future updates. Undo or Dismissed brings back retained updates."],
+  work: ["What am I keeping track of?", "One row per discovered ticket or PR related to you: assigned now or previously, created, followed, or discussed. It stays here after handoff or completion; there is no age cutoff after discovery.", "Status badges use the source’s wording. Groups help organize the list; reading an item does not clear its updates. Last known means the latest sync did not retrieve that item, so its status may have changed."],
+  dismissed: ["What did I hide?", "Updates you dismissed, plus items hidden with the old interface. Restore brings back that row and preserves its read state.", "Dismissal never stops future updates. If a restored update is read, turn off Unread only in Updates to see it."],
 };
+function rememberView() {
+  preferences.views ||= {};
+  preferences.views[state.view] = {query:state.query, source:state.source, unread:state.unread, workFilter:state.workFilter, sort:state.sort, limit:Number.isFinite(state.limit) ? state.limit : 'all', selected:[...state.selected]};
+  preferences.lastView = state.view;
+  savePreferences();
+}
+function restoreView(view) {
+  const saved = preferences.views?.[view] || {};
+  state.view = view;
+  state.query = typeof saved.query === 'string' ? saved.query : '';
+  state.source = ['all','jira','ado','azure_repos'].includes(saved.source) ? saved.source : 'all';
+  state.unread = view === 'dismissed' ? false : typeof saved.unread === 'boolean' ? saved.unread : view === 'updates';
+  state.workFilter = ['all','assigned','reviewer','my_prs','previously_assigned','following'].includes(saved.workFilter) ? saved.workFilter : 'all';
+  state.sort = ['status','recent','attention'].includes(saved.sort) ? saved.sort : 'status';
+  state.limit = saved.limit === 'all' ? Infinity : Number.isInteger(saved.limit) && saved.limit > 0 ? saved.limit : pageSize();
+  state.selected = new Set(Array.isArray(saved.selected) ? saved.selected.filter(id => typeof id === 'string') : []);
+  $("#searchInput").value = state.query; $("#sourceFilter").value = state.source; $("#workFilter").value = state.workFilter; $("#workSort").value = state.sort;
+}
 const reasonHelp = {
   previously_assigned: "Previously assigned to you, including completed work.", assigned: "Assigned to your authenticated account.", reviewer: "You are listed as a reviewer on this active pull request.",
   mentioned: "A structured mention in a recent comment targets your account.", replied: "A later comment from someone else follows your participation; it may not be a direct reply.",
@@ -63,7 +81,7 @@ function viewItems(data, view) {
 }
 function matches(item) {
   const text = [item.title, item.item_title, item.key, item.item_key, item.project, item.repository, item.status, item.summary].filter(Boolean).join(" ").toLowerCase();
-  const relationship = state.workFilter === "all" || (state.workFilter === "reviewer" ? needsReview(item) : state.workFilter === "my_prs" ? item.source === "azure_repos" && item.reasons?.includes("author") : state.workFilter === "following" ? !item.reasons?.includes("assigned") && item.reasons?.some(reason => ["watching","participant","author","waiting"].includes(reason)) : item.reasons?.includes(state.workFilter));
+  const relationship = state.workFilter === "all" || (state.workFilter === "assigned" ? item.reasons?.includes("assigned") && !item.metadata?.snapshot_only && item.status_category !== "done" && item.source_type !== "pull_request" : state.workFilter === "reviewer" ? needsReview(item) : state.workFilter === "my_prs" ? item.source === "azure_repos" && item.reasons?.includes("author") : state.workFilter === "following" ? !item.reasons?.includes("assigned") && item.reasons?.some(reason => ["watching","participant","author","waiting"].includes(reason)) : item.reasons?.includes(state.workFilter));
   return (state.view !== "work" || relationship) && (!state.query || text.includes(state.query.toLowerCase())) && (state.source === "all" || item.source === state.source) && (!state.unread || item.unread);
 }
 function rowTemplate(item) {
@@ -78,7 +96,10 @@ function rowTemplate(item) {
 
   if (item.metadata?.failed_checks) flags.push(`<span class="status-badge blocked" title="Reported pull-request checks have failed or returned an error.">${Number(item.metadata.failed_checks)} failed checks</span>`);
   if (item.metadata?.unresolved_threads) flags.push(`<span class="status-badge stale" title="Unresolved discussion threads on this pull request.">${Number(item.metadata.unresolved_threads)} open threads</span>`);
-  if (item.stale) flags.push('<span class="status-badge stale" title="No source update within your configured stale threshold; this does not necessarily mean blocked.">Stale</span>');
+  if (item.stale && item.status_category !== 'done' && !item.metadata?.snapshot_only) {
+    const days = state.dashboard.stale_after_days ?? 30;
+    flags.push(`<span class="status-badge stale" title="The latest ${item.source_type === 'pull_request' ? 'captured PR activity' : 'source update'} is more than ${days} days old. This does not mean overdue, blocked, unread, or a failed sync.">No recent ${item.source_type === 'pull_request' ? 'activity' : 'changes'} · ${days}+ days</span>`);
+  }
   const isEvent = item.entity_kind === "activity";
   const changes = item.changes || [];
   const genericUpdate = isEvent && item.event_type === "updated" && !changes.length;
@@ -96,11 +117,11 @@ function rowTemplate(item) {
 function renderHealth(health) {
   const values = Object.values(health || {});
   const labels = {ok:"Synced",partial:"Partial coverage",error:"Sync failed",auth_required:"Sign-in needed",disabled:"Disabled",loading:"Loading"};
-  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
-  const impaired = values.filter(item => ["partial","error","auth_required"].includes(item.state));
+  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${item.state === "partial" && item.coverage?.completed_history ? "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
+  const impaired = values.filter(item => ["error","auth_required"].includes(item.state) || item.state === "partial" && (item.coverage?.unavailable_queries || []).some(query => query !== "closed_history:rotating_batch"));
   $("#notice").hidden = !impaired.length;
   $("#notice").textContent = impaired.map(item => `${item.connector === "azure_devops" ? "ADO" : "Jira"}: ${item.message}`).join(" · ");
-  $("#lastRefresh").textContent = "Source status · " + (values.every(item => item.last_success_at) ? "Last successful sync shown per source" : "Waiting for source data");
+  $("#lastRefresh").textContent = values.map(item => `${item.connector === "azure_devops" ? "ADO" : "Jira"}: ${item.message}${item.last_success_at ? ` Last successful sync ${relativeTime(item.last_success_at)}.` : ""}`).join(" ");
 }
 function render() {
   const data = state.dashboard;
@@ -111,13 +132,16 @@ function render() {
   $("#summary").textContent = `${summary.assigned} assigned items · ${prs.length} open PR${prs.length === 1 ? "" : "s"} · ${reviewCount} ${reviewCount === 1 ? "needs" : "need"} your review`;
   const windows = data.collection_windows || {};
   const retention = data.activity_retention_days || 60;
-  $("#coverageSummary").textContent = state.view === 'work' ? 'Tracked items · No age cutoff after discovery · Includes completed work · Historical discovery is incomplete.' : state.view === 'updates' ? `${data.activity.length} retained events across ${new Set(data.activity.map(item => item.item_id)).size} items · Last ${retention} days · Captured events, not a complete source history.` : `Dismissed updates are recoverable only within the ${retention}-day retention window.`;
-  $("#windowDetails").textContent = `Update retention: ${retention} days. Jira mentions/replies: ${windows.jira_mentions_days || 30} days; participation: ${windows.jira_participation_days || 90} days, in configured projects. ADO comment discovery: ${windows.ado_mentions_days || 30} days from retrieved items. Discovery caps: Jira ${windows.jira_query_cap || 1000} per query; ADO ${windows.ado_item_cap || 1000} work items and ${windows.ado_comment_cap || 250} comment candidates; PR queries 100 per role. Established tracked items do not expire. Missing events cannot be reconstructed from retention alone.`;
+  $("#coverageSummary").textContent = state.view === 'work' ? 'Tracked items · No age cutoff' : state.view === 'updates' ? `${data.activity.length} updates · ${new Set(data.activity.map(item => item.item_id)).size} items · Last ${retention} days` : `Dismissed updates · Retained for ${retention} days`;
+  const discovery = `Discovery is incomplete. ${windows.jira_comment_discovery_enabled === false ? "Jira comment discovery is off until project keys are configured." : `Jira looks back ${windows.jira_mentions_days ?? 30} days for mentions/replies and ${windows.jira_participation_days ?? 90} days for participation, in configured projects.`} ADO checks comments from the last ${windows.ado_mentions_days ?? 30} days on retrieved work. Queries are capped at ${windows.jira_query_cap ?? 1000} Jira results per query, ${windows.ado_item_cap ?? 1000} ADO work items, ${windows.ado_comment_cap ?? 250} ADO comment candidates, and 100 PRs per role. ADO followed subscriptions are not collected.`;
+  $("#windowDetails").textContent = state.view === 'work' ? `These limits affect finding items, not how long tracked items stay. ${discovery}` : state.view === 'updates' ? `Only captured events from the last ${retention} days are kept—not every change in the source. ${discovery} ADO revision details and local comparisons are limited; open the source for full history.` : `Dismissed updates expire ${retention} days after the event, not after dismissal. Expired events cannot be restored. Legacy hidden work items have no age cutoff.`;
   const progress = data.health?.jira?.coverage?.completed_history;
   $("#historyProgress").hidden = !progress;
   if (progress) $("#historyProgress").textContent = `Jira older history: ${progress.checked} of ${progress.total} discovered completed tickets checked this pass · ${progress.remaining} remaining · ${progress.batches_remaining} batches${progress.failed ? " · ETA unavailable until failed checks recover" : progress.remaining ? ` · Estimated ${Math.ceil(progress.eta_seconds / 60)} min at the automatic refresh pace while running` : ' · Pass complete'}${progress.failed ? ` · ${progress.failed} checks failed and will be retried` : ''}. This refresh pass restarts after app restart; it is not all-time discovery progress.`;
   const guide = viewGuides[state.view];
-  $("#viewGuide").innerHTML = `<p><strong>${escapeHtml(guide[0])}</strong></p><p>${escapeHtml(guide[1])}</p><p><strong>Next step:</strong> ${escapeHtml(guide[2])}</p>`;
+  $("#helpTitle").textContent = `About ${views[state.view][0]}`;
+  $("#aboutView").textContent = `About ${views[state.view][0]}`;
+  $("#viewGuide").innerHTML = `<p><strong>${escapeHtml(guide[0])}</strong> ${escapeHtml(guide[1])}</p><p>${escapeHtml(guide[2])}</p><p>${state.view === 'work' ? 'Updates is a recent-events inbox, so it can contain fewer rows than My work. No recent changes means the last retrieved source update is older than ' + (data.stale_after_days ?? 30) + ' days; it is not a due date or sync warning.' : state.view === 'updates' ? `Events expire after ${retention} days. Tracked items in My work do not expire, so that list can be larger.` : ''}</p>`;
   for (const view of Object.keys(views)) {
     const entries = viewItems(data, view);
     $(`[data-count="${view}"]`).textContent = view === "dismissed" ? entries.length : `${entries.filter(item => item.unread).length} unread / ${entries.length}`;
@@ -133,7 +157,6 @@ function render() {
   $("#sortLabel").hidden = state.view !== "work";
   $("#unreadLabel").hidden = state.view === "dismissed";
   $("#unreadFilter").checked = state.unread;
-  $(".guide-note").textContent = `Use Updates to catch up; use My work to act. Dismissal affects update events only, never the work item or future updates. Undo and Dismissed can restore retained entries. Activity expires after ${data.activity_retention_days || 60} days. Coverage is not yet all-time: comment discovery is bounded and ADO followed subscriptions are not collected.`;
   const all = viewItems(data, state.view);
   const filtered = all.filter(matches);
   const expanded = filtered.filter(item => state.view !== "work" || state.sort !== "status" || !collapsed().includes(statusInfo(item)[1]));
@@ -155,6 +178,11 @@ function render() {
   const emptyText = state.view === "updates" && state.unread && !state.query && state.source === "all" ? "Turn off Unread only to see previously seen updates. My work still contains your current tasks and PRs." : filtering ? "Try a different search or clear the filters." : healthy ? "New work will appear here after your sources refresh." : "Check the source status above. Your work appears after a successful sync.";
   $("#workList").innerHTML = filtered.length ? renderRows(filtered, visible) : `<div class="empty-state"><div class="empty-icon" aria-hidden="true">${filtering ? "⌕" : "—"}</div><strong>${emptyTitle}</strong><span>${emptyText}</span></div>`;
   $("#workList").setAttribute("aria-busy", "false");
+  rememberView();
+  $("#showAllNow").hidden = visible.length >= expanded.length;
+  $("#clearSelection").hidden = !state.selected.size;
+  $("#batchRead").hidden = $("#batchUnread").hidden = !state.selected.size;
+  $("#selectionCount").hidden = !state.selected.size;
   $("#showMore").hidden = visible.length >= expanded.length;
   $("#showMore").textContent = `Show next ${Math.min(pageSize(), expanded.length - visible.length)} items`;
 }
@@ -199,8 +227,7 @@ async function applyAction(entityId, action) {
 document.addEventListener("click", async event => {
   const viewButton = event.target.closest("[data-view]");
   if (viewButton) {
-    state.view = viewButton.dataset.view; state.limit = pageSize(); state.query = ""; state.source = "all"; state.workFilter = "all"; state.selected.clear(); state.sort = "status"; $("#workSort").value = "status"; state.unread = state.view === "updates";
-    $("#searchInput").value = ""; $("#sourceFilter").value = "all"; $("#workFilter").value = "all";
+    rememberView(); restoreView(viewButton.dataset.view);
     render();
   }
   const action = event.target.closest("[data-action]");
@@ -231,16 +258,17 @@ $("#undoDismiss").addEventListener("click", async () => {
     state.undoEntries = []; $("#undoBanner").hidden = true;
   } catch(error) { showError(error); } finally { state.mutating = false; }
 });
-$("#workSort").addEventListener("change", event => { state.sort = event.target.value; state.limit = pageSize(); state.selected.clear(); render(); });
-$("#workFilter").addEventListener("change", event => { state.workFilter = event.target.value; state.limit = pageSize(); state.selected.clear(); render(); });
-$("#searchInput").addEventListener("input", event => { state.query = event.target.value.trim(); state.limit = pageSize(); state.selected.clear(); render(); });
-$("#sourceFilter").addEventListener("change", event => { state.source = event.target.value; state.limit = pageSize(); state.selected.clear(); render(); });
-$("#unreadFilter").addEventListener("change", event => { state.unread = event.target.checked; state.limit = pageSize(); state.selected.clear(); render(); });
+$("#workSort").addEventListener("change", event => { state.sort = event.target.value; state.selected.clear(); render(); });
+$("#workFilter").addEventListener("change", event => { state.workFilter = event.target.value; state.selected.clear(); render(); });
+$("#searchInput").addEventListener("input", event => { state.query = event.target.value.trim(); state.selected.clear(); render(); });
+$("#sourceFilter").addEventListener("change", event => { state.source = event.target.value; state.selected.clear(); render(); });
+$("#unreadFilter").addEventListener("change", event => { state.unread = event.target.checked; state.selected.clear(); render(); });
 $("#clearFilters").addEventListener("click", () => { state.query="";state.source="all";state.unread=false;state.workFilter="all";state.selected.clear();$("#workFilter").value="all";$("#searchInput").value="";$("#sourceFilter").value="all";$("#unreadFilter").checked=false;render(); });
 $("#showMore").addEventListener("click", () => { state.limit += pageSize(); render(); });
 $("#refreshButton").addEventListener("click", refresh);
 document.addEventListener("keydown", event => { if (event.key === "/" && !event.ctrlKey && !event.metaKey && !["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName)) { event.preventDefault(); $("#searchInput").focus(); } });
 $("#today").textContent = new Intl.DateTimeFormat("en", { weekday:"short", month:"short", day:"numeric" }).format(new Date());
+restoreView(Object.hasOwn(views, preferences.lastView) ? preferences.lastView : "updates");
 requestDashboard("/api/dashboard").catch(showError);
 setInterval(() => { if (!document.hidden && !state.mutating && !$("#refreshButton").disabled) requestDashboard("/api/dashboard").catch(showError); }, 60_000);
 
@@ -304,6 +332,15 @@ $("#selectMatching").addEventListener('click', () => { state.selected = new Set(
 $("#clearSelection").addEventListener('click', () => { state.selected.clear(); render(); });
 $("#pageSize").value = String(Number(preferences.pageSize) || 30);
 $("#showAllDefault").checked = Boolean(preferences.showAll);
-$("#pageSize").addEventListener('change', event => { preferences.pageSize = Number(event.target.value); savePreferences(); state.limit = pageSize(); render(); });
-$("#showAllDefault").addEventListener('change', event => { preferences.showAll = event.target.checked; savePreferences(); state.limit = pageSize(); render(); });
+$("#pageSize").addEventListener('change', event => { preferences.pageSize = Number(event.target.value); for (const saved of Object.values(preferences.views || {})) delete saved.limit; savePreferences(); state.limit = pageSize(); render(); });
+$("#showAllDefault").addEventListener('change', event => { preferences.showAll = event.target.checked; for (const saved of Object.values(preferences.views || {})) delete saved.limit; savePreferences(); state.limit = pageSize(); render(); });
 $("#showAllNow").addEventListener('click', () => { state.limit = Infinity; render(); });
+
+$("#aboutView").addEventListener('click', () => {
+  $("#helpLimits").open = Boolean(preferences.helpLimits?.[state.view]);
+  $("#helpDialog").showModal();
+});
+$("#closeHelp").addEventListener('click', () => $("#helpDialog").close());
+$("#helpLimits").addEventListener('toggle', () => { preferences.helpLimits ||= {}; preferences.helpLimits[state.view] = $("#helpLimits").open; savePreferences(); });
+$("#syncInfo").addEventListener('click', () => $("#syncDialog").showModal());
+$("#closeSync").addEventListener('click', () => $("#syncDialog").close());

@@ -56,6 +56,7 @@ class JiraConnector:
                         "site": self.settings.site,
                         "work_items": len(items),
                         "activity_projects": list(self.settings.activity_projects),
+                        "comment_discovery_enabled": bool(self.settings.activity_projects),
                         "structured_mentions": mention_capability,
                         "unavailable_queries": partial_queries,
                         "notification_inbox": "unsupported",
@@ -160,7 +161,7 @@ class JiraConnector:
         assigned = await asyncio.to_thread(
             self._search,
             executable,
-            "assignee = currentUser() ORDER BY updated DESC",
+            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
         )
         records: dict[str, dict[str, Any]] = {}
         roles: dict[str, set[str]] = {}
@@ -175,15 +176,22 @@ class JiraConnector:
                 identity["account_id"] = str(assignee.get("accountId") or "")
 
         queries = {
+            "assigned:completed": "assignee = currentUser() AND statusCategory = Done ORDER BY updated DESC",
             "previously_assigned": "assignee WAS currentUser() AND (assignee != currentUser() OR assignee IS EMPTY) ORDER BY updated DESC",
             "watching": "watcher = currentUser() ORDER BY updated DESC",
             "author": "(creator = currentUser() OR reporter = currentUser()) ORDER BY updated DESC",
         }
+        # Give each relationship an independent active-work budget. Closed
+        # history must never displace an older open item in a capped result.
+        for role in ('previously_assigned', 'watching', 'author'):
+            base = queries[role].removesuffix(' ORDER BY updated DESC')
+            queries[role] = f'({base}) AND statusCategory != Done ORDER BY updated DESC'
+            queries[f'{role}:completed'] = f'({base}) AND statusCategory = Done ORDER BY updated DESC'
         failed: list[str] = []
         if len(assigned) >= self.settings.max_candidates_per_query:
             failed.append("assigned:safety_limit")
         account_id = identity.get("account_id", "")
-        if account_id:
+        if account_id and self.settings.activity_projects:
             queries["participant_candidate"] = (
                 f'project IN ({projects}) AND issue IN updatedBy("{account_id}", '
                 f'"-{self.settings.participation_days}d") ORDER BY updated DESC'
@@ -192,7 +200,7 @@ class JiraConnector:
                 f'project IN ({projects}) AND comment ~ "{account_id}" '
                 f'AND updated >= -{self.settings.mention_reply_days}d ORDER BY updated DESC'
             )
-        else:
+        elif self.settings.activity_projects:
             failed.extend(["participant_candidate:no_account_id", "mention_candidate:no_account_id"])
 
         async def query(role: str, jql: str) -> tuple[str, list[dict[str, Any]] | None]:
@@ -214,7 +222,7 @@ class JiraConnector:
                 if not key:
                     continue
                 records[key] = row
-                roles.setdefault(key, set()).add(role)
+                roles.setdefault(key, set()).add(role.split(":", 1)[0])
         return records, roles, failed
 
     def _search(self, executable: str | CommandSpec, jql: str) -> list[dict[str, Any]]:

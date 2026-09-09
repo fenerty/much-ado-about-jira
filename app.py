@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from config import load_settings
 from refresh import RefreshCoordinator
 from store import Store
-from startup import StartupSettings, acquire_instance
+from startup import StartupSettings, acquire_instance, listener_identity
 
 
 settings = load_settings()
@@ -103,6 +103,11 @@ async def get_dashboard():
     return coordinator.dashboard()
 
 
+@app.get("/api/identity")
+async def identity():
+    return {"application": "much-ado-about-jira"}
+
+
 @app.get("/api/health")
 async def get_health():
     return coordinator.dashboard()["health"]
@@ -132,7 +137,7 @@ class UndoEntry(BaseModel):
 
 
 class UndoRequest(BaseModel):
-    entries: list[UndoEntry] = Field(min_length=1, max_length=1000)
+    entries: list[UndoEntry] = Field(min_length=1)
 
 
 @app.post('/api/undo-dismiss')
@@ -164,11 +169,18 @@ def main():
     import socket
     background = '--background' in sys.argv
     instance_handle = acquire_instance(settings.app.port)
-    # Also recognize servers launched before the single-instance guard existed.
-    with socket.socket() as probe:
-        running = probe.connect_ex((settings.app.host, settings.app.port)) == 0
-    if not instance_handle or running:
+    listener = listener_identity(settings.app.host, settings.app.port)
+    if listener == 'other':
+        message = f'Port {settings.app.port} is already used by another application. Close that application or choose another port in settings.toml.'
         if not background:
+            import tkinter.messagebox
+            tkinter.messagebox.showerror('Dashboard could not start', message)
+        else:
+            import logging
+            logging.error(message)
+        sys.exit(1)
+    if not instance_handle or listener == 'ours':
+        if not background and listener == 'ours':
             webbrowser.open(f"http://{settings.app.host}:{settings.app.port}")
         sys.exit(0)
     if not background:
