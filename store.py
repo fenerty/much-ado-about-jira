@@ -216,7 +216,7 @@ class Store:
         work_items: list[WorkItem] = []
         activities: list[Activity] = []
         for row in rows:
-            if row["dismissed_version"] == row["version_hash"] or (row['entity_kind'] == 'work_item' and (row['dismissed_version'] or '').startswith('work:')):
+            if row["dismissed_version"] == row["version_hash"] or (row['entity_kind'] == 'work_item' and row['dismissed_version'] is not None):
                 continue
             data = json.loads(row["payload_json"])
             data["unread"] = row["seen_version"] != row["version_hash"]
@@ -230,12 +230,12 @@ class Store:
         return work_items, activities, health
 
     def load_dismissed(self) -> list[dict]:
-        """Only retained, active entries hidden at their current version."""
+        """Durably hidden work, including legacy hashes, and current hidden events."""
         with self._lock, self._connect() as connection:
             rows = connection.execute("""
                 SELECT e.payload_json, e.entity_kind, e.version_hash, e.active, s.seen_version, s.updated_at
                 FROM entities e JOIN local_state s ON s.entity_id = e.entity_id
-                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND (e.version_hash = s.dismissed_version OR (e.entity_kind = 'work_item' AND s.dismissed_version LIKE 'work:%'))
+                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND (e.version_hash = s.dismissed_version OR (e.entity_kind = 'work_item' AND s.dismissed_version IS NOT NULL))
                 ORDER BY s.updated_at DESC
             """).fetchall()
         return [{**json.loads(row['payload_json']), 'entity_kind': row['entity_kind'],

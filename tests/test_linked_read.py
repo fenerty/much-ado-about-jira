@@ -113,3 +113,27 @@ def test_hide_work_is_durable_independent_and_undo_is_scoped(tmp_path, monkeypat
     store.restore_dismissed(second['undo_entries'])
     assert parent.id in states(store) and states(store)['event:0']
     assert client.post('/api/local-state', json={'entity_id':'event:0', 'action':'hide_work'}).status_code == 404
+
+
+def test_legacy_work_hide_survives_source_change_and_reopen(tmp_path):
+    store, parent, data = populated(tmp_path)
+    # The former interface stored a source version hash, not a work: token.
+    assert store.set_local_state(parent.id, 'dismiss')
+    store.dismiss_updates('event:0')
+    with store._connect() as connection:
+        legacy_version = connection.execute('SELECT dismissed_version FROM local_state WHERE entity_id = ?', (parent.id,)).fetchone()[0]
+    assert not legacy_version.startswith('work:')
+    data.work_items[0] = parent.model_copy(update={'status':'Blocked', 'updated_at':NOW + timedelta(hours=1)})
+    data.activities[0] = data.activities[0].model_copy(update={'summary':'A new source change'})
+    store.replace_connector(data, 60)
+    reopened = Store(store.database_path)
+    reopened.initialize()
+    assert parent.id not in states(reopened)
+    hidden = reopened.load_dismissed()
+    assert [entry['id'] for entry in hidden] == [parent.id]
+    assert hidden[0]['status'] == 'Blocked'
+    # Update hides remain version-specific; other work and events are untouched.
+    assert states(reopened)['event:0']
+    assert states(reopened)['jira:issue:OTHER']
+    assert reopened.set_local_state(parent.id, 'restore')
+    assert parent.id in states(reopened) and not reopened.load_dismissed()

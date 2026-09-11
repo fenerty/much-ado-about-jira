@@ -46,7 +46,7 @@ def result(item):
     )
 
 
-def test_baseline_seen_then_change_unread_and_dismiss_resurfaces(tmp_path):
+def test_baseline_seen_then_change_unread_and_hidden_work_requires_restore(tmp_path):
     store = Store(tmp_path / "dashboard.sqlite3")
     store.initialize()
     first = make_item()
@@ -68,6 +68,9 @@ def test_baseline_seen_then_change_unread_and_dismiss_resurfaces(tmp_path):
 
     changed_again = make_item("In Progress", NOW + timedelta(hours=2))
     store.replace_connector(result(changed_again), 60)
+    work, _, _ = store.load()
+    assert work == []
+    assert store.set_local_state(changed_again.id, 'restore')
     work, _, _ = store.load()
     assert work[0].unread is True
 
