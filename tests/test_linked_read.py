@@ -56,3 +56,60 @@ def test_mixed_batch_uses_original_selection_and_preserves_dismissals(tmp_path):
     assert not states(store)['event:2']
     store.mark_batch([parent.id],'unread')
     assert states(store)[parent.id] and not states(store)['event:0']
+
+
+def test_read_related_via_api_reads_siblings_preserves_hidden_and_future(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as application
+    store, parent, data = populated(tmp_path)
+    undo = store.dismiss_updates('event:2')
+    monkeypatch.setattr(application, 'store', store)
+    monkeypatch.setattr(application.coordinator, 'store', store)
+    client = TestClient(application.app)
+    response = client.post('/api/local-state', json={'entity_id': 'event:0', 'action': 'seen_related'})
+    assert response.status_code == 200
+    after = states(store)
+    assert not after[parent.id] and not after['event:0'] and not after['event:1']
+    assert after['other:event'] and after['jira:issue:OTHER']
+    assert len(store.load_dismissed()) == 1
+    store.restore_dismissed(undo)
+    assert not states(store)['event:2']
+    assert states(Store(store.database_path)) == states(store)
+    data.activities.append(data.activities[0].model_copy(update={'id': 'future:event'}))
+    store.replace_connector(data, 60)
+    assert states(store)['future:event']
+    assert not states(store)['event:1']
+    assert client.post('/api/local-state', json={'entity_id': 'missing', 'action': 'seen_related'}).status_code == 404
+
+
+def test_read_related_without_parent_still_reads_only_matching_events(tmp_path):
+    store, parent, data = populated(tmp_path)
+    with store._connect() as connection:
+        connection.execute('DELETE FROM entities WHERE entity_id = ?', (parent.id,))
+    assert store.set_local_state('event:1', 'seen_related')
+    after = states(store)
+    assert all(not after[f'event:{i}'] for i in range(3))
+    assert after['other:event']
+
+
+def test_hide_work_is_durable_independent_and_undo_is_scoped(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as application
+    store, parent, data = populated(tmp_path)
+    monkeypatch.setattr(application, 'store', store)
+    monkeypatch.setattr(application.coordinator, 'store', store)
+    client = TestClient(application.app)
+    first = client.post('/api/local-state', json={'entity_id':parent.id, 'action':'hide_work'})
+    assert first.status_code == 200
+    assert parent.id not in states(store) and states(store)['event:0']
+    data.work_items[0] = parent.model_copy(update={'status':'Blocked'})
+    store.replace_connector(data, 60)
+    assert parent.id not in states(store)
+    assert store.load_dismissed()[0]['status'] == 'Blocked'
+    assert len(store.load()[1]) == 4
+    second = client.post('/api/local-state', json={'entity_id':parent.id, 'action':'hide_work'}).json()
+    store.restore_dismissed(first.json()['undo_entries'])
+    assert parent.id not in states(store)
+    store.restore_dismissed(second['undo_entries'])
+    assert parent.id in states(store) and states(store)['event:0']
+    assert client.post('/api/local-state', json={'entity_id':'event:0', 'action':'hide_work'}).status_code == 404

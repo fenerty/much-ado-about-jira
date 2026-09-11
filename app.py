@@ -84,7 +84,7 @@ async def set_startup(request: StartupRequest):
 
 class LocalStateRequest(BaseModel):
     entity_id: str
-    action: Literal["seen", "unread", "dismiss", "dismiss_related", "restore"]
+    action: Literal["seen", "seen_related", "unread", "dismiss", "dismiss_related", "hide_work", "restore"]
 
 
 class BatchReadRequest(BaseModel):
@@ -121,10 +121,15 @@ async def refresh_dashboard():
 
 @app.post("/api/local-state")
 async def update_local_state(request: LocalStateRequest):
+    if request.action == 'hide_work':
+        undo = store.hide_work(request.entity_id)
+        if not undo:
+            raise HTTPException(status_code=404, detail='Work item not found')
+        return {**coordinator.dashboard(), 'undo_entries': undo}
     if request.action in {'dismiss', 'dismiss_related'}:
         undo = store.dismiss_updates(request.entity_id, request.action == 'dismiss_related')
         if not undo:
-            raise HTTPException(status_code=404, detail='Update no longer available for dismissal')
+            raise HTTPException(status_code=404, detail='Update no longer available to hide')
         return {**coordinator.dashboard(), 'undo_entries': undo}
     if not store.set_local_state(request.entity_id, request.action):
         raise HTTPException(status_code=404, detail="Dashboard item not found")

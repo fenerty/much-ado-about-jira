@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -215,7 +216,7 @@ class Store:
         work_items: list[WorkItem] = []
         activities: list[Activity] = []
         for row in rows:
-            if row["dismissed_version"] == row["version_hash"]:
+            if row["dismissed_version"] == row["version_hash"] or (row['entity_kind'] == 'work_item' and (row['dismissed_version'] or '').startswith('work:')):
                 continue
             data = json.loads(row["payload_json"])
             data["unread"] = row["seen_version"] != row["version_hash"]
@@ -232,13 +233,28 @@ class Store:
         """Only retained, active entries hidden at their current version."""
         with self._lock, self._connect() as connection:
             rows = connection.execute("""
-                SELECT e.payload_json, e.entity_kind, s.updated_at
+                SELECT e.payload_json, e.entity_kind, e.version_hash, e.active, s.seen_version, s.updated_at
                 FROM entities e JOIN local_state s ON s.entity_id = e.entity_id
-                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND e.version_hash = s.dismissed_version
+                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND (e.version_hash = s.dismissed_version OR (e.entity_kind = 'work_item' AND s.dismissed_version LIKE 'work:%'))
                 ORDER BY s.updated_at DESC
             """).fetchall()
         return [{**json.loads(row['payload_json']), 'entity_kind': row['entity_kind'],
+                 'unread': row['seen_version'] != row['version_hash'],
+                 'metadata': {**json.loads(row['payload_json']).get('metadata', {}), 'snapshot_only': not bool(row['active'])},
                  'dismissed_at': row['updated_at']} for row in rows]
+
+    def hide_work(self, entity_id: str) -> list[dict]:
+        """Hide inventory until restored; related updates remain independent."""
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if not connection.execute("SELECT 1 FROM entities WHERE entity_id = ? AND entity_kind = 'work_item'", (entity_id,)).fetchone():
+                return []
+            token = 'work:' + uuid.uuid4().hex
+            connection.execute('''INSERT INTO local_state(entity_id, dismissed_version, updated_at)
+                VALUES(?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET
+                dismissed_version = excluded.dismissed_version, updated_at = excluded.updated_at''',
+                (entity_id, token, utc_now().isoformat()))
+            return [{'entity_id': entity_id, 'version': token}]
 
     def dismiss_updates(self, entity_id: str, all_for_item: bool = False) -> list[dict]:
         """Hide existing update events, never their parent item or future updates."""
@@ -275,7 +291,8 @@ class Store:
         """Read an event plus its parent, or selected work plus its current events.
 
         Expand from the original selection only: reading one event must not
-        recursively read its siblings. Unread remains an explicit row action.
+        recursively read its siblings unless seen_related is requested.
+        Unread remains an explicit row action.
         """
         with self._lock, self._connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -283,12 +300,14 @@ class Store:
             by_id = {row['entity_id']: row for row in rows}
             selected = set(entity_ids) & by_id.keys()
             targets = set(selected)
-            if action == 'seen':
+            if action in {'seen', 'seen_related'}:
                 selected_work = {entity_id for entity_id in selected if by_id[entity_id]['entity_kind'] == 'work_item'}
                 for entity_id in selected:
                     row = by_id[entity_id]
                     if row['entity_kind'] == 'activity':
                         parent_id = json.loads(row['payload_json'])['item_id']
+                        if action == 'seen_related':
+                            selected_work.add(parent_id)
                         if parent_id in by_id and by_id[parent_id]['entity_kind'] == 'work_item':
                             targets.add(parent_id)
                 for row in rows:
@@ -299,11 +318,11 @@ class Store:
                 connection.execute('''INSERT INTO local_state(entity_id, seen_version, updated_at)
                     VALUES(?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET
                     seen_version = excluded.seen_version, updated_at = excluded.updated_at''',
-                    (entity_id, by_id[entity_id]['version_hash'] if action == 'seen' else None, now))
+                    (entity_id, by_id[entity_id]['version_hash'] if action in {'seen', 'seen_related'} else None, now))
             return len(selected)
 
-    def set_local_state(self, entity_id: str, action: Literal["seen", "unread", "dismiss", "restore"]) -> bool:
-        if action in {'seen', 'unread'}:
+    def set_local_state(self, entity_id: str, action: Literal["seen", "seen_related", "unread", "dismiss", "restore"]) -> bool:
+        if action in {'seen', 'seen_related', 'unread'}:
             return bool(self.mark_batch([entity_id], action))
         with self._lock, self._connect() as connection:
             row = connection.execute(
