@@ -8,7 +8,7 @@ Much ADO About Jira should be the natural place an engineer starts and returns t
 - My work defaults to visible status groups, with completed items last and recent changes first within each group. Exact source status labels are preserved. Recently updated remains an optional sort.
 - Counts use ordinary, literal labels. Open PRs includes authored PRs; PRs needing my review is a distinct subset. Drafts and PRs already voted on are not pending first reviews.
 - One work item appears once in My work, even when it has several relationships. Update events can appear separately and say what changed when known.
-- Dismissing updates never hides their work item or mutes future updates. Scope is explicit, Undo is available, and retained dismissed entries can be restored.
+- Hiding updates never hides their work item or mutes future updates. Scope is explicit, Undo is available, and retained hidden entries can be restored.
 - Coverage and evidence limitations must be honest. Source-confirmed history, observed snapshot differences, and unavailable details are distinct.
 
 ## Intended coverage
@@ -26,10 +26,12 @@ Current and previous assignments, authored work, followed/watched items, and wor
 
 The next coverage milestone is a durable relationship registry plus bounded backfill and incremental polling. It must preserve known involvement, distinguish closed work from deleted/unavailable work, and report what is and is not collected. Do not claim full historical coverage before validating it.
 
-Mark read is linked across views: selected updates read their parent work items; selected work items read all currently retained updates. Expand only from explicitly selected work, so an update does not recursively read its siblings. Mark unread stays local to selected rows. Dismissal state and future unread changes are preserved.
+My work is an inventory with no read/unread controls, counts, filtering, or styling. Hide keeps work items hidden until explicitly restored; updates remain independently visible. In Updates, Mark read reads one update and Read all for item reads its current siblings. Mark unread stays local to selected rows. Hidden state and future unread changes are preserved.
 
 Jira completed detail refresh rotates through 16 discovered closed tickets per refresh; active candidates refresh each time. Search caps still apply. Partial coverage remains explicit during rotation.
 
 Display preferences support 30/50/100/250 rows or all rows. Explicit all-matching selection includes collapsed groups and undisplayed pages. Group order and collapsed state persist per browser. Coverage counts distinguish retained events, distinct event parents, durable work, and bounded discovery; rotating history progress is per process/session pass, with ETA withheld on failed checks.
 
 Keep explanations contextual: one About popout per view, optional discovery details, routine progress under Sync details, and visible actionable sync failures. Preserve view filters, shown-row count, group preferences, selections, and last view across navigation/reload. Explicit Clear filters and Clear selection are the ways to reset those choices.
+
+Updates also offers **Read all for item** when other unread updates exist for that item. It marks all currently retained related updates read, including filtered or hidden updates, without unhiding anything. Future updates remain unread. Ordinary Mark read keeps its single-update scope. Hide moves updates out of the inbox without marking them read; Hidden and Undo restore retained entries.

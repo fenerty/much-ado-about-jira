@@ -586,8 +586,14 @@ input[type=checkbox] {
 
 .row-actions {
   display:flex;
+  flex-wrap:wrap;
   gap:4px;
 }
+.date-filters { padding:12px 20px; border-bottom:1px solid var(--border, #394454); }
+.date-filters summary { cursor:pointer; font-size:13px; font-weight:600; }
+.date-filter-controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:12px 0; }
+.date-filter-controls label { display:flex; align-items:center; gap:8px; }
+.date-filter-controls input[type="number"] { padding:8px; border:1px solid #718096; border-radius:5px; background:transparent; color:inherit; }
 
 .icon-button {
   width:30px;
@@ -787,6 +793,7 @@ footer {
   }
   .row-side {
     grid-column:2;
+    flex-wrap:wrap;
     justify-content:space-between;
     gap:8px;
   }
