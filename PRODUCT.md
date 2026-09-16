@@ -8,6 +8,7 @@ Much ADO About Jira should be the natural place an engineer starts and returns t
 - My work defaults to visible status groups, with completed items last and recent changes first within each group. Exact source status labels are preserved. Recently updated remains an optional sort.
 - Counts use ordinary, literal labels. Open PRs includes authored PRs; PRs needing my review is a distinct subset. Drafts and PRs already voted on are not pending first reviews.
 - One work item appears once in My work, even when it has several relationships. Update events can appear separately and say what changed when known.
+- Read and hidden update state tracks event content, not changing relationship labels. Adding, reordering, or expiring participation labels must not resurface an unchanged event. Existing saved acknowledgements remain valid on upgrade; already mismatched legacy acknowledgements are not automatically marked read because the acknowledged content is unavailable.
 - Hiding updates never hides their work item or mutes future updates. Scope is explicit, Undo is available, and retained hidden entries can be restored.
 - Coverage and evidence limitations must be honest. Source-confirmed history, observed snapshot differences, and unavailable details are distinct.
 

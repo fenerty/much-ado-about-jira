@@ -63,11 +63,20 @@ class Store:
         return connection
 
     @staticmethod
+    def _activity_version(raw: dict) -> str:
+        # Relationships describe why an event is relevant now, not what changed
+        # in the source. Lookback expiry must not reset read or hidden state.
+        content = {key: value for key, value in raw.items() if key not in {'reasons', 'unread'}}
+        payload = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
     def _payload(model: WorkItem | Activity) -> tuple[str, str]:
         raw = model.model_dump(mode="json")
         raw["unread"] = False
         payload = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        version = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+        version = (Store._activity_version(raw) if isinstance(model, Activity)
+                   else hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24])
         return payload, version
 
     def replace_connector(self, result: ConnectorResult, retention_days: int) -> None:
@@ -155,6 +164,16 @@ class Store:
         now: str,
     ) -> None:
         payload, version = self._payload(model)
+        if kind == 'activity':
+            previous = connection.execute(
+                "SELECT payload_json, version_hash FROM entities WHERE entity_id = ?",
+                (model.id,),
+            ).fetchone()
+            if previous and self._activity_version(json.loads(previous['payload_json'])) == version:
+                # Reuse legacy full-payload versions until source content changes.
+                # This preserves seen/dismissed versions and outstanding Undo tokens
+                # without migrating or guessing previously acknowledged content.
+                version = previous['version_hash']
         connection.execute(
             """
             INSERT INTO entities(
