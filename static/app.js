@@ -14,7 +14,7 @@ const views = {
   dismissed: ["Hidden", "Bring back retained updates or items you previously hid.", "Restore an entry"],
 };
 const viewGuides = {
-  updates: ["What changed?", "One row per captured change, comment, mention, or reply. A ticket can have several updates—or none in the retained window.", "Mark read reads this update. Read all for item reads all current updates for the same item, including filtered or hidden updates. New updates still arrive unread. Read updates remain in the inbox when Unread only is off. Hide moves updates to Hidden without changing read state; Undo or Restore brings them back."],
+  updates: ["What changed?", "All updates shows each captured change, comment, mention, or reply. Latest per item shows the newest update per item that matches your filters. Switching modes preserves all updates.", "Mark read reads this update; an older unread update may appear next in Latest per item. Read all for item reads all current updates for the same item, including filtered or hidden updates. New updates still arrive unread. Read updates remain in the inbox when Unread only is off. Hide moves updates to Hidden without changing read state; Undo or Restore brings them back."],
   work: ["What am I keeping track of?", "One row per discovered ticket or PR related to you: assigned now or previously, created, followed, or discussed. It stays here after handoff or completion; there is no age cutoff after discovery.", "Status badges use the source’s wording. Mark read also reads all current updates for that item. Mark unread affects only the selected rows. New updates still arrive unread. Last known means the latest sync did not retrieve that item, so its status may have changed."],
   dismissed: ["What did I hide?", "Updates you hid, and work items you hid from My work. Restore brings back that row and preserves its read state.", "Hiding never stops future updates. If a restored update is read, turn off Unread only in Updates to see it."],
 };
@@ -27,6 +27,7 @@ function rememberView() {
 function restoreView(view) {
   const saved = preferences.views?.[view] || {};
   state.view = view;
+  state.updatesDisplayMode = preferences.updatesDisplayMode === 'latest_per_item' ? 'latest_per_item' : 'all';
   state.query = typeof saved.query === 'string' ? saved.query : '';
   state.source = ['all','jira','ado','azure_repos'].includes(saved.source) ? saved.source : 'all';
   state.unread = view !== 'updates' ? false : typeof saved.unread === 'boolean' ? saved.unread : view === 'updates';
@@ -111,6 +112,19 @@ function matches(item) {
   const text = [item.title, item.item_title, item.key, item.item_key, item.project, item.repository, item.status, item.summary].filter(Boolean).join(" ").toLowerCase();
   const relationship = state.workFilter === "all" || (state.workFilter === "assigned" ? item.reasons?.includes("assigned") && !item.metadata?.snapshot_only && item.status_category !== "done" && item.source_type !== "pull_request" : state.workFilter === "reviewer" ? needsReview(item) : state.workFilter === "my_prs" ? item.source === "azure_repos" && item.reasons?.includes("author") : state.workFilter === "following" ? !item.reasons?.includes("assigned") && item.reasons?.some(reason => ["watching","participant","author","waiting"].includes(reason)) : item.reasons?.includes(state.workFilter));
   return (state.view !== "work" || relationship) && (!state.query || text.includes(state.query.toLowerCase())) && (state.source === "all" || item.source === state.source) && (!state.unread || item.unread);
+}
+function matchingRows(items) {
+  const matching = items.filter(matches);
+  if (state.view !== 'updates' || state.updatesDisplayMode !== 'latest_per_item') return matching;
+  // Sort a fresh array: never change the retained activity or its read state.
+  matching.sort((a, b) => (Date.parse(b.timestamp) || 0) - (Date.parse(a.timestamp) || 0)
+    || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const latest = new Map();
+  for (const item of matching) {
+    const key = item.item_id || item.id;
+    if (!latest.has(key)) latest.set(key, item);
+  }
+  return [...latest.values()];
 }
 function rowTemplate(item) {
   const key = item.key || item.item_key;
@@ -199,8 +213,10 @@ function render() {
   $("#sortLabel").hidden = state.view !== "work";
   $("#unreadLabel").hidden = state.view !== "updates";
   $("#unreadFilter").checked = state.unread;
+  $('#updatesDisplay').hidden = state.view !== 'updates';
+  for (const input of document.querySelectorAll('[name="updatesDisplayMode"]')) input.checked = input.value === state.updatesDisplayMode;
   const all = viewItems(data, state.view);
-  const filtered = all.filter(matches);
+  const filtered = matchingRows(all);
   const expanded = filtered.filter(item => state.view !== "work" || state.sort !== "status" || !collapsed().includes(statusInfo(item)[1]));
   const visible = expanded.slice(0, state.limit);
   const visibleIds = new Set(visible.map(item => item.id));
@@ -211,10 +227,14 @@ function render() {
   $("#selectVisible").checked = visible.length > 0 && visible.every(item => state.selected.has(item.id));
   $("#selectVisible").indeterminate = state.selected.size > 0 && !visible.every(item => state.selected.has(item.id));
   $("#batchRead").disabled = $("#batchUnread").disabled = !state.selected.size || state.mutating;
-  $("#readCounts").textContent = state.view !== "updates" ? "" : `${all.filter(item => item.unread).length} unread · ${all.filter(item => !item.unread).length} read · ${all.length} total in this view`;
+  $("#readCounts").textContent = state.view !== "updates" ? "" : `${all.filter(item => item.unread).length} unread · ${all.filter(item => !item.unread).length} read · ${all.length} total updates in this view`;
   const filtering = Boolean(state.query || state.source !== "all" || state.unread || state.workFilter !== "all" || state.dateMode !== 'all' || state.recentOnly);
   $("#clearFilters").hidden = !filtering;
-  $("#resultCount").textContent = `${visible.length} of ${filtered.length} items${filtering ? ` · ${all.length} in view` : ""}`;
+  $("#resultCount").textContent = state.view === 'updates'
+    ? state.updatesDisplayMode === 'latest_per_item'
+      ? `${visible.length} of ${filtered.length} matching items · latest update each`
+      : `${visible.length} of ${filtered.length} matching updates`
+    : `${visible.length} of ${filtered.length} items${filtering ? ` · ${all.length} in view` : ""}`;
   const healthy = Object.values(data.health || {}).some(item => item.last_success_at);
   const emptyTitle = state.view === "updates" && state.unread && !state.query && state.source === "all" && state.dateMode === "all" && !state.recentOnly ? "No unread updates" : filtering ? "No matching items" : healthy ? "Nothing in this view" : "No source data yet";
   const emptyText = state.view === "updates" && state.unread && !state.query && state.source === "all" && state.dateMode === "all" && !state.recentOnly ? "Turn off Unread only to see previously seen updates. My work still contains your current tasks and PRs." : filtering ? "Try a different search or clear the filters." : healthy ? "New work will appear here after your sources refresh." : "Check the source status above. Your work appears after a successful sync.";
@@ -301,6 +321,15 @@ $("#undoDismiss").addEventListener("click", async () => {
   } catch(error) { showError(error); } finally { state.mutating = false; }
 });
 $("#workSort").addEventListener("change", event => { state.sort = event.target.value; state.selected.clear(); render(); });
+$('#updatesDisplay').addEventListener('change', event => {
+  if (event.target.name !== 'updatesDisplayMode' || !['all','latest_per_item'].includes(event.target.value)) return;
+  state.updatesDisplayMode = event.target.value;
+  preferences.updatesDisplayMode = state.updatesDisplayMode;
+  state.selected.clear();
+  state.limit = pageSize();
+  savePreferences();
+  render();
+});
 $("#workFilter").addEventListener("change", event => { state.workFilter = event.target.value; state.selected.clear(); render(); });
 $("#searchInput").addEventListener("input", event => { state.query = event.target.value.trim(); state.selected.clear(); render(); });
 $("#sourceFilter").addEventListener("change", event => { state.source = event.target.value; state.selected.clear(); render(); });
@@ -375,7 +404,7 @@ document.addEventListener('click', event => {
   if (move) { const order = groupOrder(), index = order.indexOf(move.dataset.move), target = index + Number(move.dataset.direction); if (target < 0 || target >= order.length) return; [order[index],order[target]] = [order[target],order[index]]; preferences.groupOrder = order; }
   if (toggle || move) { savePreferences(); render(); }
 });
-$("#selectMatching").addEventListener('click', () => { state.selected = new Set(viewItems(state.dashboard,state.view).filter(matches).map(item => item.id)); render(); });
+$("#selectMatching").addEventListener('click', () => { state.selected = new Set(matchingRows(viewItems(state.dashboard,state.view)).map(item => item.id)); render(); });
 $("#clearSelection").addEventListener('click', () => { state.selected.clear(); render(); });
 $("#pageSize").value = String(Number(preferences.pageSize) || 30);
 $("#showAllDefault").checked = Boolean(preferences.showAll);
