@@ -31,6 +31,13 @@
       <div id="actionNotice" class="notice" role="alert" hidden></div>
       <section class="queue" aria-label="Work queue">
         <div class="toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="Search title, key, or project…" aria-label="Search current view" title="Search this view. Keyboard shortcut: press / to focus search."></label><div class="filters"><label class="sr-only" for="sourceFilter">Source</label><select id="sourceFilter"><option value="all">All sources</option><option value="jira">Jira</option><option value="ado">Azure DevOps</option><option value="azure_repos">Azure Repos</option></select><label class="sr-only" for="workFilter">Work relationship</label><select id="workFilter" hidden><option value="all">All my work</option><option value="assigned">Assigned to me</option><option value="reviewer">Needs my review</option><option value="my_prs">My pull requests</option><option value="previously_assigned">Previously assigned</option><option value="following">Following</option></select><label id="unreadLabel" class="unread-filter"><input id="unreadFilter" type="checkbox"> Unread only</label><button id="clearFilters" class="text-button" hidden>Clear filters</button></div></div>
+        <div id="updatesDisplay" class="updates-display">
+          <div class="segmented-control" role="group" aria-label="Updates display" aria-describedby="updatesDisplayHelp">
+            <label><input type="radio" name="updatesDisplayMode" value="all" checked><span>All updates</span></label>
+            <label><input type="radio" name="updatesDisplayMode" value="latest_per_item"><span>Latest per item</span></label>
+          </div>
+          <span id="updatesDisplayHelp">Show the newest update per item that matches your filters.</span>
+        </div>
         <details id="dateFilters" class="date-filters">
           <summary id="dateFilterSummary">Date &amp; activity</summary>
           <div class="date-filter-controls">
