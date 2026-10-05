@@ -27,7 +27,7 @@ async def test_jira_search_includes_prior_assignment_without_project_or_time_cut
     from config import JiraSettings
     connector = JiraConnector(JiraSettings(activity_projects=('ENG',)), 30)
     queries = []
-    def search(executable, jql):
+    async def search(executable, jql, **kwargs):
         queries.append(jql)
         return [{'key': 'ENG-7'}] if 'assignee WAS' in jql else []
     monkeypatch.setattr(connector, '_search', search)
@@ -35,4 +35,4 @@ async def test_jira_search_includes_prior_assignment_without_project_or_time_cut
     assert roles['ENG-7'] == {'previously_assigned'}
     historical = next(q for q in queries if 'assignee WAS' in q)
     assert 'project IN' not in historical and 'updated >=' not in historical
-    assert not failures
+    assert failures == ['closed_history:rotating_batch']

@@ -42,6 +42,14 @@ class JiraSettings:
     mention_reply_days: int = 30
     participation_days: int = 90
     max_candidates_per_query: int = 1000
+    refresh_timeout_seconds: int = 120
+    history_timeout_seconds: int = 15
+    history_batch_size: int = 50
+
+    def __post_init__(self):
+        for name in ("max_candidates_per_query", "refresh_timeout_seconds", "history_timeout_seconds", "history_batch_size"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"jira.{name} must be positive")
 
 
 @dataclass(frozen=True)

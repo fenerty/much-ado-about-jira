@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import shutil
+import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from config import JiraSettings
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_jira_read_command, safe_error
-from .base import CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
+from .base import CommandSpec, ConnectorFailure, async_run_command, display_name, local_cli_bridge, parse_datetime, parse_json_output, unique_strings
+from .jira_history import HISTORY_ROLES, JiraHistory
 
 
 class JiraConnector:
@@ -20,27 +26,62 @@ class JiraConnector:
     def __init__(self, settings: JiraSettings, timeout_seconds: int):
         self.settings = settings
         self.timeout_seconds = timeout_seconds
+        self._saved_state: dict = {}
+        self._deadline: float | None = None
+        self._command_slots = asyncio.Semaphore(4)
+        self._fresh_roles: dict[str, set[str]] = {}
+        self._verified_history_roles: dict[str, set[str]] = {}
+        self._enrichment_failures: list[str] = []
+
+    def load_state(self, state: dict) -> None:
+        self._saved_state = state
+        if hasattr(self, "_history"):
+            del self._history
+
+    def checkpoint(self) -> dict:
+        return self._history.checkpoint() if hasattr(self, "_history") else {}
+
+    def _ensure_history(self, identity: dict[str, str]) -> None:
+        scope = hashlib.sha256(json.dumps({
+            "site": identity.get("site") or self.settings.site,
+            "email": identity.get("email") or self.settings.expected_account,
+            "projects": self.settings.activity_projects,
+            "participation_days": self.settings.participation_days,
+            "mention_reply_days": self.settings.mention_reply_days,
+        }, sort_keys=True).encode()).hexdigest()
+        if not hasattr(self, "_history") or self._history.scope != scope:
+            self._history = JiraHistory(scope, self._saved_state)
 
     async def refresh(self) -> ConnectorResult:
         attempted = utc_now()
         if not self.settings.enabled:
             return self._result("disabled", "Jira connector is disabled", attempted)
+        self._deadline = time.monotonic() + self.settings.refresh_timeout_seconds
+        self._command_slots = asyncio.Semaphore(4)
+        self._enrichment_failures = []
         try:
             executable = self._find_cli()
-            identity = await asyncio.to_thread(self._authenticate, executable)
-            records, query_roles, partial_queries = await self._query_candidates(executable, identity)
-            records, hydrate_failures = await self._hydrate_candidates(executable, records)
+            identity = await self._authenticate(executable)
+            candidates, query_roles, partial_queries = await self._query_candidates(executable, identity, include_history=False)
+            records, hydrate_failures = await self._hydrate_candidates(executable, candidates, include_history=False)
             partial_queries.extend(hydrate_failures)
+            # Commit active reads to this result before spending any history budget.
+            await self._discover_history(executable, candidates, query_roles, partial_queries)
+            history_candidates = {key: {"key": key, "fields": {"status": {"name": "Done"}}} for key in self._history.records}
+            historical, history_failures = await self._hydrate_candidates(executable, history_candidates, verified=set(records))
+            records.update(historical)
+            partial_queries.extend(history_failures)
             items, activities, mention_capability = await self._normalize(
                 executable, records, query_roles, identity
             )
+            partial_queries.extend(self._enrichment_failures)
             partial = bool(partial_queries)
             state = "partial" if partial else "ok"
             message = "Jira refreshed successfully"
             if partial:
                 message = "Jira refreshed with some unavailable query paths"
                 if set(partial_queries) == {"closed_history:rotating_batch"}:
-                    message = "Jira refreshed; completed-ticket history refreshes in rotating batches of 16"
+                    message = "Jira refreshed; older history discovery and details advance in saved batches"
             return ConnectorResult(
                 connector=self.name,
                 work_items=items,
@@ -53,6 +94,7 @@ class JiraConnector:
                     last_success_at=utc_now(),
                     coverage={
                         "completed_history": {**getattr(self, "_history_progress", {}), "last_sync_seconds": (utc_now() - attempted).total_seconds()},
+                        "history_discovery": self._discovery_progress,
                         "site": self.settings.site,
                         "work_items": len(items),
                         "activity_projects": list(self.settings.activity_projects),
@@ -60,7 +102,7 @@ class JiraConnector:
                         "structured_mentions": mention_capability,
                         "unavailable_queries": partial_queries,
                         "notification_inbox": "unsupported",
-                        "previous_assignment_query": "previously_assigned" not in partial_queries,
+                        "previous_assignment_query": not any(query.startswith("previously_assigned:") and ":completed:" not in query for query in partial_queries),
                         "historical_coverage": "Partial: comment discovery is bounded by configured projects and lookback windows",
                     },
                 ),
@@ -116,9 +158,16 @@ class JiraConnector:
             return executable
         return local_cli_bridge("acli")
 
-    def _run(self, executable: str | CommandSpec, args: list[str]) -> str:
+    async def _run(self, executable: str | CommandSpec, args: list[str]) -> str:
         assert_jira_read_command(args)
-        output = run_command(executable, args, self.timeout_seconds)
+        async with self._command_slots:
+            remaining = self.timeout_seconds if self._deadline is None else self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectorFailure("JIRA_TIMEOUT", "Jira refresh budget exhausted")
+            try:
+                output = await async_run_command(executable, args, min(self.timeout_seconds, remaining))
+            except subprocess.TimeoutExpired:
+                raise ConnectorFailure("JIRA_TIMEOUT", "Jira read command timed out") from None
         if output.returncode:
             message = (output.stderr or output.stdout).lower()
             auth = any(word in message for word in ("auth", "login", "credential", "unauthorized"))
@@ -129,8 +178,8 @@ class JiraConnector:
             )
         return output.stdout
 
-    def _authenticate(self, executable: str | CommandSpec) -> dict[str, str]:
-        output = self._run(executable, ["jira", "auth", "status"])
+    async def _authenticate(self, executable: str | CommandSpec) -> dict[str, str]:
+        output = await self._run(executable, ["jira", "auth", "status"])
         expected = self.settings.expected_account.strip().lower()
         if expected and expected not in output.lower():
             try:
@@ -144,25 +193,44 @@ class JiraConnector:
                     "Atlassian CLI identity does not match the configured corporate account",
                     auth_required=True,
                 )
-        identity = {"email": self.settings.expected_account, "account_id": "", "display_name": ""}
+        identity = {"email": "", "account_id": "", "display_name": "", "site": ""}
         try:
             data = parse_json_output(output)
             if isinstance(data, dict):
                 identity["account_id"] = str(data.get("accountId") or data.get("account_id") or "")
                 identity["display_name"] = str(data.get("displayName") or identity["display_name"])
+                identity["email"] = str(data.get("email") or data.get("emailAddress") or identity["email"])
+                identity["site"] = str(data.get("site") or "")
         except ValueError:
             pass
+        email = re.search(r"(?im)^\s*Email:\s*(\S+)", output)
+        site = re.search(r"(?im)^\s*Site:\s*(\S+)", output)
+        if email:
+            identity["email"] = email.group(1).lower()
+        if site:
+            identity["site"] = site.group(1)
+        configured_site = urlparse(self.settings.site).hostname or self.settings.site
+        actual_site = urlparse("https://" + identity["site"].removeprefix("https://").rstrip("/")).hostname
+        if not identity["email"] or not actual_site:
+            raise ConnectorFailure("IDENTITY_UNAVAILABLE", "Atlassian CLI did not expose an account and site", auth_required=True)
+        identity["email"] = identity["email"].strip().lower()
+        if expected and identity["email"] != expected:
+            raise ConnectorFailure(
+                "IDENTITY_MISMATCH",
+                "Atlassian CLI identity does not match the configured corporate account",
+                auth_required=True,
+            )
+        if configured_site and actual_site.lower() != configured_site.lower():
+            raise ConnectorFailure("SITE_MISMATCH", "Atlassian CLI site does not match the configured Jira site", auth_required=True)
+        identity["site"] = actual_site.lower()
         return identity
 
     async def _query_candidates(
-        self, executable: str | CommandSpec, identity: dict[str, str]
+        self, executable: str | CommandSpec, identity: dict[str, str], *, include_history: bool = True
     ) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]], list[str]]:
         projects = ", ".join(f'"{project}"' for project in self.settings.activity_projects)
-        assigned = await asyncio.to_thread(
-            self._search,
-            executable,
-            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
-        )
+        self._ensure_history(identity)
+        assigned = await self._search(executable, "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC")
         records: dict[str, dict[str, Any]] = {}
         roles: dict[str, set[str]] = {}
         for row in assigned[: self.settings.max_candidates_per_query]:
@@ -175,18 +243,14 @@ class JiraConnector:
             if isinstance(assignee, dict) and not identity.get("account_id"):
                 identity["account_id"] = str(assignee.get("accountId") or "")
 
-        queries = {
-            "assigned:completed": "assignee = currentUser() AND statusCategory = Done ORDER BY updated DESC",
+        relationships = {
+            "assigned": "assignee = currentUser()",
             "previously_assigned": "assignee WAS currentUser() AND (assignee != currentUser() OR assignee IS EMPTY) ORDER BY updated DESC",
             "watching": "watcher = currentUser() ORDER BY updated DESC",
             "author": "(creator = currentUser() OR reporter = currentUser()) ORDER BY updated DESC",
         }
-        # Give each relationship an independent active-work budget. Closed
-        # history must never displace an older open item in a capped result.
-        for role in ('previously_assigned', 'watching', 'author'):
-            base = queries[role].removesuffix(' ORDER BY updated DESC')
-            queries[role] = f'({base}) AND statusCategory != Done ORDER BY updated DESC'
-            queries[f'{role}:completed'] = f'({base}) AND statusCategory = Done ORDER BY updated DESC'
+        relationships = {role: jql.removesuffix(" ORDER BY updated DESC") for role, jql in relationships.items()}
+        queries = {role: f"({jql}) AND statusCategory != Done ORDER BY updated DESC" for role, jql in relationships.items() if role != "assigned"}
         failed: list[str] = []
         if len(assigned) >= self.settings.max_candidates_per_query:
             failed.append("assigned:safety_limit")
@@ -205,15 +269,15 @@ class JiraConnector:
 
         async def query(role: str, jql: str) -> tuple[str, list[dict[str, Any]] | None]:
             try:
-                found = await asyncio.to_thread(self._search, executable, jql)
-            except ConnectorFailure:
+                found = await self._search(executable, jql)
+            except (ConnectorFailure, ValueError, OSError) as exc:
+                failed.append(f"{role}:{getattr(exc, 'code', type(exc).__name__)}")
                 return role, None
             return role, found
 
         results = await asyncio.gather(*(query(role, jql) for role, jql in queries.items()))
         for role, found in results:
             if found is None:
-                failed.append(role)
                 continue
             if len(found) >= self.settings.max_candidates_per_query:
                 failed.append(f"{role}:safety_limit")
@@ -222,12 +286,53 @@ class JiraConnector:
                 if not key:
                     continue
                 records[key] = row
-                roles.setdefault(key, set()).add(role.split(":", 1)[0])
+                roles.setdefault(key, set()).add(role)
+        self._fresh_roles = {key: set(value) for key, value in roles.items()}
+        self._verified_history_roles = {}
+        if include_history:
+            await self._discover_history(executable, records, roles, failed)
         return records, roles, failed
 
-    def _search(self, executable: str | CommandSpec, jql: str) -> list[dict[str, Any]]:
+    async def _discover_history(self, executable, records, roles, failed) -> None:
+        relationships = {
+            "assigned": "assignee = currentUser()",
+            "previously_assigned": "assignee WAS currentUser() AND (assignee != currentUser() OR assignee IS EMPTY)",
+            "watching": "watcher = currentUser()",
+            "author": "creator = currentUser() OR reporter = currentUser()",
+        }
+
+        # Discovery is a single limited page after active work, with an all-time
+        # keyset cursor per relationship. A failed role is retried on rotation.
+        role = HISTORY_ROLES[self._history.next_role]
+        self._history.next_role = (self._history.next_role + 1) % len(HISTORY_ROLES)
+        cursor = self._history.cursors[role]
+        jql = f"({relationships[role]}) AND statusCategory = Done"
+        if cursor:
+            jql += f" AND key > {json.dumps(cursor)}"
+        jql += " ORDER BY key ASC"
+        page_size = min(self.settings.history_batch_size, self.settings.max_candidates_per_query)
+        try:
+            page = await asyncio.wait_for(self._search(executable, jql, limit=page_size), timeout=self.settings.history_timeout_seconds)
+            self._history.accept_page(role, [self._key(row) for row in page], len(page) >= page_size)
+            self._verified_history_roles = {self._key(row): {role} for row in page}
+        except (TimeoutError, ConnectorFailure, ValueError, OSError) as exc:
+            failed.append(f"{role}:completed:{getattr(exc, 'code', type(exc).__name__)}")
+        self._discovery_progress = {
+            "batch_size": page_size, "last_role": role,
+            "roles_with_completed_pass": sum(count > 0 for count in self._history.passes.values()),
+            "total_roles": len(HISTORY_ROLES), "passes": dict(self._history.passes),
+            "remaining_source_items": "unknown", "all_time_queries": True,
+        }
+        for key, historical_roles in self._history.records.items():
+            if key not in records:
+                records[key] = {"key": key, "fields": {"status": {"name": "Done"}}, "history_only": True}
+            roles.setdefault(key, set()).update(historical_roles)
+        if not all(self._history.passes.values()):
+            failed.append("closed_history:rotating_batch")
+
+    async def _search(self, executable: str | CommandSpec, jql: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         fields = "key,summary,status,priority,assignee,creator,reporter"
-        output = self._run(
+        output = await self._run(
             executable,
             [
                 "jira",
@@ -238,21 +343,25 @@ class JiraConnector:
                 "--fields",
                 fields,
                 "--json",
-                "--paginate",
+                "--limit",
+                str(limit if limit is not None else self.settings.max_candidates_per_query),
             ],
         )
-        return self._records(parse_json_output(output))
+        data = parse_json_output(output)
+        if isinstance(data, list) and any(not isinstance(row, dict) or not self._key(row) for row in data):
+            raise ValueError("Jira search returned invalid work items")
+        return self._records(data)
 
     async def _hydrate_candidates(
-        self, executable: str | CommandSpec, records: dict[str, dict[str, Any]]
+        self, executable: str | CommandSpec, records: dict[str, dict[str, Any]], *, include_history: bool = True, verified: set[str] | None = None
     ) -> tuple[dict[str, dict[str, Any]], list[str]]:
         semaphore = asyncio.Semaphore(8)
 
         async def hydrate(key: str) -> tuple[str, dict[str, Any] | None]:
             async with semaphore:
                 try:
-                    row = await asyncio.to_thread(self._view, executable, key)
-                except ConnectorFailure:
+                    row = await self._view(executable, key)
+                except (ConnectorFailure, ValueError, OSError):
                     return key, None
                 return key, row
 
@@ -265,31 +374,50 @@ class JiraConnector:
             status = fields.get('status') or {}
             name = str(status.get('name') or '') if isinstance(status, dict) else str(status)
             category = str((status.get('statusCategory') or {}).get('name') or '') if isinstance(status, dict) else ''
-            if self._status_category(name, category) == 'done':
+            if self._status_category(name, category) == 'done' and (include_history or key not in self._fresh_roles):
                 closed.append(key)
             else:
                 candidates.append(key)
-        closed.sort()
-        checked = getattr(self, '_history_checked', set()) & set(closed)
-        if closed and len(checked) == len(closed):
-            checked = set()
-        batch = [key for key in closed if key not in checked][:16]
-        candidates.extend(batch)
+        if not hasattr(self, "_history"):
+            self._ensure_history({})
+        for key in closed:
+            self._history.records.setdefault(key, {"previously_assigned"})
         hydrated: dict[str, dict[str, Any]] = {}
-        failures: list[str] = ['closed_history:rotating_batch'] if len(closed) > len(batch) else []
+        failures: list[str] = []
+        # Active hydration completes before historical work starts.
         for key, row in await asyncio.gather(*(hydrate(key) for key in candidates)):
             if row is None:
                 failures.append(f"view:{key}")
             else:
                 hydrated[key] = row
-        checked.update(key for key in batch if key in hydrated)
-        self._history_checked = checked
-        remaining = len(closed) - len(checked)
-        self._history_progress = {'total': len(closed), 'checked': len(checked), 'remaining': remaining, 'batches_remaining': (remaining + 15) // 16, 'failed': sum(key not in hydrated for key in batch)}
+        if not include_history:
+            return hydrated, failures
+        batch = self._history.hydration_batch(16, verified=set(hydrated) | (verified or set()))
+        # Preserve each completed view when the history phase reaches its deadline.
+        history_tasks = [asyncio.create_task(hydrate(key)) for key in batch]
+        try:
+            done, _ = await asyncio.wait(history_tasks, timeout=self.settings.history_timeout_seconds) if history_tasks else (set(), set())
+        finally:
+            for task in history_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*history_tasks, return_exceptions=True)
+        completed = [task.result() for task in done if not task.cancelled() and task.exception() is None]
+        for key, row in completed:
+            if row is None:
+                failures.append(f"view:{key}")
+            else:
+                hydrated[key] = row
+        failures.extend(f"view:{key}" for key in batch if key not in hydrated and f"view:{key}" not in failures)
+        self._history.checked.update(key for key in batch if key in hydrated)
+        remaining = len(self._history.records) - len(self._history.checked)
+        if remaining:
+            failures.append("closed_history:rotating_batch")
+        self._history_progress = {'total': len(self._history.records), 'checked': len(self._history.checked), 'remaining': remaining, 'batches_remaining': (remaining + 15) // 16, 'failed': sum(key not in hydrated for key in batch), 'scope': 'discovered history only; discovery may still be in progress'}
         return hydrated, failures
 
-    def _view(self, executable: str | CommandSpec, key: str) -> dict[str, Any]:
-        output = self._run(
+    async def _view(self, executable: str | CommandSpec, key: str) -> dict[str, Any]:
+        output = await self._run(
             executable,
             [
                 "jira",
@@ -347,8 +475,16 @@ class JiraConnector:
             category = self._status_category(status, category_name)
             roles = set(query_roles.get(key, set()))
             assignee = fields.get("assignee") or {}
-            if "assigned" in roles and isinstance(assignee, dict) and not identity.get("account_id"):
-                identity["account_id"] = str(assignee.get("accountId") or "")
+            historical_roles = self._history.records.get(key, set()) if hasattr(self, "_history") else set()
+            if historical_roles:
+                # Saved discovery evidence is not a current relationship. In
+                # particular, a reopened/reassigned ticket must not be assigned.
+                roles = set(self._fresh_roles.get(key, set())) | self._verified_history_roles.get(key, set())
+                if "assigned" in historical_roles or "previously_assigned" in historical_roles:
+                    roles.discard("assigned")
+                    roles.add("assigned" if self._is_self(assignee, identity) else "previously_assigned")
+                if "author" in historical_roles and any(self._is_self(fields.get(field) or {}, identity) for field in ("creator", "reporter")):
+                    roles.add("author")
             reasons = [role for role in ("assigned", "watching", "author", "previously_assigned") if role in roles]
             if "author" in roles:
                 reasons.append("waiting")
@@ -360,7 +496,10 @@ class JiraConnector:
             if (not comments or comment_total > len(comments)) and (
                 "participant_candidate" in roles or "mention_candidate" in roles
             ):
-                comments = await asyncio.to_thread(self._comment_list, executable, key)
+                try:
+                    comments = await self._comment_list(executable, key)
+                except (ConnectorFailure, ValueError, OSError) as exc:
+                    self._enrichment_failures.append(f"comments:{key}:{getattr(exc, 'code', type(exc).__name__)}")
             comment_reasons, comment_activity, structured = self._comment_signals(
                 key, title, comments, identity
             )
@@ -368,7 +507,7 @@ class JiraConnector:
             reasons.extend(comment_reasons)
             if "participant_candidate" in roles and "participant" not in reasons:
                 roles.discard("participant_candidate")
-            if not reasons:
+            if not reasons and not historical_roles:
                 continue
             project = key.split("-", 1)[0]
             item = WorkItem(
@@ -388,7 +527,7 @@ class JiraConnector:
                 created_at=parse_datetime(fields.get("created")),
                 actionable=(category == "blocked" or bool({"mentioned", "replied"} & set(reasons))),
                 reasons=unique_strings(reasons),
-                metadata={"status_category_source": category_name or "derived"},
+                metadata={"status_category_source": category_name or "derived", **({"tracked_relationships": sorted(historical_roles)} if historical_roles else {})},
             )
             items.append(item)
             activities.append(
@@ -408,8 +547,8 @@ class JiraConnector:
             activities.extend(comment_activity)
         return items, activities, structured_mentions_seen
 
-    def _comment_list(self, executable: str | CommandSpec, key: str) -> list[dict[str, Any]]:
-        output = self._run(
+    async def _comment_list(self, executable: str | CommandSpec, key: str) -> list[dict[str, Any]]:
+        output = await self._run(
             executable,
             ["jira", "workitem", "comment", "list", "--key", key, "--json", "--paginate"],
         )

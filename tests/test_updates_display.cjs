@@ -21,6 +21,27 @@ const event = (id, parent, date, extra = {}) => ({id, item_id:parent, timestamp:
 const seed = (ui, events) => ui.run(`state.dashboard.activity = ${JSON.stringify(events)}; render();`);
 const mode = (ui, value) => ui.element('#updatesDisplay').listeners.change({target:{name:'updatesDisplayMode',value}});
 
+test('partial timeout coverage is visible even while older history is updating', () => {
+  const ui = setup();
+  ui.run(`renderHealth({jira:{connector:'jira',state:'partial',message:'An optional history read timed out',coverage:{completed_history:{total:50},unavailable_queries:['closed_history:rotating_batch','assigned:completed:JIRA_TIMEOUT']}}});`);
+  assert.match(ui.element('#health').innerHTML, /Partial coverage/);
+  assert.doesNotMatch(ui.element('#health').innerHTML, /Synced · older history updating/);
+  assert.equal(ui.element('#notice').hidden, false);
+  assert.match(ui.element('#notice').textContent, /timed out/);
+  ui.run(`renderHealth({jira:{connector:'jira',state:'partial',message:'History is advancing',coverage:{completed_history:{total:50},unavailable_queries:['closed_history:rotating_batch']}}});`);
+  assert.match(ui.element('#health').innerHTML, /Synced · older history updating/);
+  assert.equal(ui.element('#notice').hidden, true);
+});
+
+test('history progress distinguishes saved discovered-ticket checks from unknown source discovery', () => {
+  const ui = setup();
+  ui.run(`state.dashboard.health={jira:{connector:'jira',state:'partial',message:'History is advancing',coverage:{completed_history:{total:50,checked:16,remaining:34,batches_remaining:3,failed:0,eta_seconds:540},history_discovery:{roles_with_completed_pass:1,total_roles:4},unavailable_queries:['closed_history:rotating_batch']}}}; render();`);
+  assert.match(ui.element('#historyProgress').textContent, /16 of 50 discovered tickets/);
+  assert.match(ui.element('#historyProgress').textContent, /1 of 4 relationship searches/);
+  assert.match(ui.element('#historyProgress').textContent, /remaining are unknown/);
+  assert.match(ui.element('#historyProgress').textContent, /saved across restarts/);
+});
+
 test('default retains all updates; latest uses parent identity, newest timestamp and stable ID tie break', () => {
   const ui = setup();
   const events = [event('older','jira:A','2026-09-01'),event('z','jira:A','2026-09-15'),event('a','jira:A','2026-09-15'),event('ado','ado:A','2026-09-14',{source:'ado'}),event('missing','jira:B',null)];

@@ -62,6 +62,35 @@ class Store:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def load_connector_state(self, connector: str) -> dict:
+        """Return a connector's durable refresh progress, or a clean fallback."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_meta WHERE key = ?",
+                (f"connector_state:{connector}",),
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            state = json.loads(row["value"])
+        except (ValueError, TypeError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    def save_connector_state(self, connector: str, state: dict) -> None:
+        """Persist refresh progress independently of entities and local triage."""
+        if not isinstance(state, dict):
+            raise TypeError("Connector state must be a dictionary")
+        payload = json.dumps(state, sort_keys=True)
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_meta(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (f"connector_state:{connector}", payload),
+            )
+
     @staticmethod
     def _activity_version(raw: dict) -> str:
         # Relationships describe why an event is relevant now, not what changed
@@ -208,6 +237,18 @@ class Store:
 
     @staticmethod
     def _write_health(connection: sqlite3.Connection, health: ConnectorHealth) -> None:
+        if health.last_success_at is None:
+            previous = connection.execute(
+                "SELECT health_json FROM connector_runs WHERE connector = ?",
+                (health.connector,),
+            ).fetchone()
+            if previous is not None:
+                try:
+                    previous_health = ConnectorHealth.model_validate_json(previous["health_json"])
+                except ValueError:
+                    pass
+                else:
+                    health = health.model_copy(update={"last_success_at": previous_health.last_success_at})
         payload = json.dumps(health.model_dump(mode="json"), sort_keys=True)
         connection.execute(
             """
