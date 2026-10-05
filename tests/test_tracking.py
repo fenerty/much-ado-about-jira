@@ -46,7 +46,7 @@ async def _exercise_history_rotation():
     from config import JiraSettings
     connector = JiraConnector(JiraSettings(),30)
     keys=[]
-    def view(executable,key):
+    async def view(executable,key):
         keys.append(key)
         return {'key':key}
     connector._view=view
@@ -71,13 +71,15 @@ def test_history_progress_reports_remaining_and_retries_failures():
     from connectors.base import ConnectorFailure
     connector = JiraConnector(JiraSettings(),30)
     records={f'ENG-{i:02d}': {'fields': {'status': {'name':'Closed','statusCategory':{'name':'Done'}}}} for i in range(35)}
-    def view(executable,key):
+    async def view(executable,key):
         if key == 'ENG-00': raise ConnectorFailure('FAILED','synthetic')
         return {'key':key}
     connector._view=view
     asyncio.run(connector._hydrate_candidates('unused',records))
-    assert connector._history_progress == {'total':35,'checked':15,'remaining':20,'batches_remaining':2,'failed':1}
-    connector._view=lambda executable,key: {'key':key}
+    assert {key: connector._history_progress[key] for key in ('total','checked','remaining','batches_remaining','failed')} == {'total':35,'checked':15,'remaining':20,'batches_remaining':2,'failed':1}
+    async def successful_view(executable, key):
+        return {'key': key}
+    connector._view=successful_view
     asyncio.run(connector._hydrate_candidates('unused',records))
     assert connector._history_progress['remaining'] == 4
     asyncio.run(connector._hydrate_candidates('unused',records))

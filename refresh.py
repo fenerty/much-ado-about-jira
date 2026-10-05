@@ -34,13 +34,20 @@ class RefreshCoordinator:
                 if result is not None:
                     if result.health.state in {"ok", "partial"}:
                         self.store.replace_connector(result, self.settings.app.activity_retention_days)
+                        if result.connector == "jira":
+                            jira = next(connector for connector in self.connectors if connector.name == "jira")
+                            self.store.save_connector_state("jira", jira.checkpoint())
                     else:
                         self.store.record_health(result.health)
 
     async def _run_connector(self, connector) -> ConnectorResult | None:
         try:
+            if isinstance(connector, JiraConnector):
+                connector.load_state(self.store.load_connector_state("jira"))
+            timeout = (self.settings.jira.refresh_timeout_seconds if connector.name == "jira"
+                       else self.settings.app.connector_timeout_seconds) + 5
             result = await asyncio.wait_for(
-                connector.refresh(), timeout=self.settings.app.connector_timeout_seconds + 5
+                connector.refresh(), timeout=timeout
             )
             return result
         except TimeoutError:

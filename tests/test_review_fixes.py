@@ -14,17 +14,18 @@ from connectors.base import completed_within
 async def test_active_jira_assignments_have_budget_separate_from_completed(monkeypatch):
     connector=JiraConnector(JiraSettings(max_candidates_per_query=2),30)
     queries=[]
-    def search(executable,jql):
+    async def search(executable,jql, *, limit=None):
         queries.append(jql)
-        if jql.startswith('assignee = currentUser()'):
+        if 'assignee = currentUser()' in jql and 'assignee WAS' not in jql:
             if 'statusCategory != Done' in jql: return [{'key':'ENG-OLD-ACTIVE'}]
-            return [{'key':f'ENG-DONE-{i}'} for i in range(5)]
+            return [{'key':f'ENG-{i}'} for i in range(limit)]
         return []
     monkeypatch.setattr(connector,'_search',search)
     records, roles, failures=await connector._query_candidates('unused',{'account_id':'synthetic'})
     assert 'ENG-OLD-ACTIVE' in records and len(records)==3
     assert roles['ENG-OLD-ACTIVE']=={'assigned'}
-    assert 'assigned:completed:safety_limit' in failures
+    assert 'closed_history:rotating_batch' in failures
+    assert connector.checkpoint()['cursors']['assigned'] == 'ENG-1'
     assert not any('project IN ()' in query for query in queries)
     assert not any('participant' in failure or 'mention' in failure for failure in failures)
     for role in ('assignee WAS','watcher =','creator ='):

@@ -26,3 +26,7 @@ activity_projects = ["ENG"]
 mention_reply_days = 30
 participation_days = 90
 max_candidates_per_query = 1000
+# Jira's whole refresh budget is separate from the per-command app timeout.
+refresh_timeout_seconds = 120
+history_timeout_seconds = 15
+history_batch_size = 50

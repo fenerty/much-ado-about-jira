@@ -158,10 +158,14 @@ function rowTemplate(item) {
       ${eventDetails}
     </a><div class="row-side"><span class="age" title="${escapeHtml(timestamp ? new Date(timestamp).toLocaleString() : "Not available")}">${escapeHtml(relativeTime(timestamp))}</span><div class="row-actions">${rowActions}</div></div></article>`;
 }
+function routineHistory(item) {
+  const queries = item.coverage?.unavailable_queries || [];
+  return item.state === 'partial' && item.coverage?.completed_history && queries.length > 0 && queries.every(query => query === 'closed_history:rotating_batch');
+}
 function renderHealth(health) {
   const values = Object.values(health || {});
   const labels = {ok:"Synced",partial:"Partial coverage",error:"Sync failed",auth_required:"Sign-in needed",disabled:"Disabled",loading:"Loading"};
-  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${item.state === "partial" && item.coverage?.completed_history ? "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
+  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${routineHistory(item) ? "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
   const impaired = values.filter(item => ["error","auth_required"].includes(item.state) || item.state === "partial" && (item.coverage?.unavailable_queries || []).some(query => query !== "closed_history:rotating_batch"));
   $("#notice").hidden = !impaired.length;
   $("#notice").textContent = impaired.map(item => `${item.connector === "azure_devops" ? "ADO" : "Jira"}: ${item.message}`).join(" · ");
@@ -193,7 +197,8 @@ function render() {
   $("#windowDetails").textContent = state.view === 'work' ? `These limits affect finding items, not how long tracked items stay. ${discovery}` : state.view === 'updates' ? `Only captured events from the last ${retention} days are kept—not every change in the source. ${discovery} ADO revision details and local comparisons are limited; open the source for full history.` : `Hidden updates expire ${retention} days after the event, not after hiding. Expired events cannot be restored. Hidden work items stay hidden until restored and have no age cutoff.`;
   const progress = data.health?.jira?.coverage?.completed_history;
   $("#historyProgress").hidden = !progress;
-  if (progress) $("#historyProgress").textContent = `Jira older history: ${progress.checked} of ${progress.total} discovered completed tickets checked this pass · ${progress.remaining} remaining · ${progress.batches_remaining} batches${progress.failed ? " · ETA unavailable until failed checks recover" : progress.remaining ? ` · Estimated ${Math.ceil(progress.eta_seconds / 60)} min at the automatic refresh pace while running` : ' · Pass complete'}${progress.failed ? ` · ${progress.failed} checks failed and will be retried` : ''}. This refresh pass restarts after app restart; it is not all-time discovery progress.`;
+  const historyDiscovery = data.health?.jira?.coverage?.history_discovery;
+  if (progress) $("#historyProgress").textContent = `Jira older history: ${progress.checked} of ${progress.total} discovered tickets checked this pass · ${progress.remaining} remaining · ${progress.batches_remaining} batches${progress.failed ? " · ETA unavailable until failed checks recover" : progress.remaining ? ` · Estimated ${Math.ceil(progress.eta_seconds / 60)} min for these discovered tickets while running` : ' · Discovered-ticket pass complete'}${progress.failed ? ` · ${progress.failed} checks failed and will be retried` : ''}. ${historyDiscovery ? `Discovery: ${historyDiscovery.roles_with_completed_pass} of ${historyDiscovery.total_roles} relationship searches have completed an all-time pass; additional source tickets remaining are unknown. Progress is saved across restarts.` : 'This is not all-time discovery progress.'}`;
   const guide = viewGuides[state.view];
   $("#helpTitle").textContent = `About ${views[state.view][0]}`;
   $("#aboutView").textContent = `About ${views[state.view][0]}`;
