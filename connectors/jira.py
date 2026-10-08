@@ -10,7 +10,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from config import JiraSettings, source_scope
@@ -33,6 +33,8 @@ class JiraConnector:
         self._verified_history_roles: dict[str, set[str]] = {}
         self._enrichment_failures: list[str] = []
         self.state_loader = None
+        self.scope_verified: Callable[[str], None] | None = None
+        self.verified_cache_scope: str | None = None
 
     def load_state(self, state: dict) -> None:
         self._saved_state = state
@@ -54,6 +56,7 @@ class JiraConnector:
             self._history = JiraHistory(scope, self._saved_state)
 
     async def refresh(self) -> ConnectorResult:
+        self.verified_cache_scope = None
         attempted = utc_now()
         if not self.settings.enabled:
             return self._result("disabled", "Jira connector is disabled", attempted)
@@ -63,9 +66,11 @@ class JiraConnector:
         try:
             executable = self._find_cli()
             identity = await self._authenticate(executable)
-            verified_cache_scope = source_scope(self.name, identity["site"], identity["email"])
+            self.verified_cache_scope = source_scope(self.name, identity["site"], identity["email"])
+            if self.scope_verified is not None:
+                self.scope_verified(self.verified_cache_scope)
             if self.state_loader is not None:
-                self.load_state(self.state_loader(verified_cache_scope))
+                self.load_state(self.state_loader(self.verified_cache_scope))
             candidates, query_roles, partial_queries = await self._query_candidates(executable, identity, include_history=False)
             records, hydrate_failures = await self._hydrate_candidates(executable, candidates, include_history=False)
             partial_queries.extend(hydrate_failures)
@@ -88,7 +93,7 @@ class JiraConnector:
                     message = "Jira refreshed; older history discovery and details advance in saved batches"
             return ConnectorResult(
                 connector=self.name,
-                cache_scope=verified_cache_scope,
+                cache_scope=self.verified_cache_scope,
                 work_items=items,
                 activities=activities,
                 health=ConnectorHealth(
@@ -118,9 +123,13 @@ class JiraConnector:
                 str(exc),
                 attempted,
                 exc.code,
+                cache_scope=self.verified_cache_scope,
             )
         except (ValueError, OSError) as exc:
-            return self._result("error", "Jira read failed", attempted, exc.__class__.__name__, exc)
+            return self._result(
+                "error", "Jira read failed", attempted, exc.__class__.__name__, exc,
+                cache_scope=self.verified_cache_scope,
+            )
 
     def _result(
         self,
@@ -129,12 +138,15 @@ class JiraConnector:
         attempted: datetime,
         code: str | None = None,
         diagnostic: Exception | None = None,
+        *,
+        cache_scope: str | None = None,
     ) -> ConnectorResult:
         coverage: dict[str, Any] = {"site": self.settings.site}
         if diagnostic:
             coverage["diagnostic"] = safe_error(diagnostic)
         return ConnectorResult(
             connector=self.name,
+            cache_scope=cache_scope,
             health=ConnectorHealth(
                 connector=self.name,
                 state=state,
@@ -208,17 +220,17 @@ class JiraConnector:
                 identity["site"] = str(data.get("site") or "")
         except ValueError:
             pass
-        email = re.search(r"(?im)^\s*Email:\s*(\S+)", output)
-        site = re.search(r"(?im)^\s*Site:\s*(\S+)", output)
+        email = re.search(r"(?im)^[ \t]*Email:[ \t]*(\S+)", output)
+        site = re.search(r"(?im)^[ \t]*Site:[ \t]*(\S+)", output)
         if email:
             identity["email"] = email.group(1).lower()
         if site:
             identity["site"] = site.group(1)
         configured_site = urlparse(self.settings.site).hostname or self.settings.site
         actual_site = urlparse("https://" + identity["site"].removeprefix("https://").rstrip("/")).hostname
+        identity["email"] = identity["email"].strip().lower()
         if not identity["email"] or not actual_site:
             raise ConnectorFailure("IDENTITY_UNAVAILABLE", "Atlassian CLI did not expose an account and site", auth_required=True)
-        identity["email"] = identity["email"].strip().lower()
         if expected and identity["email"] != expected:
             raise ConnectorFailure(
                 "IDENTITY_MISMATCH",

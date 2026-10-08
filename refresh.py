@@ -23,9 +23,17 @@ class RefreshCoordinator:
             AzureDevOpsConnector(settings.azure_devops, settings.app.connector_timeout_seconds),
             JiraConnector(settings.jira, settings.app.connector_timeout_seconds),
         ]
+        for connector in self.connectors:
+            connector.scope_verified = lambda cache_scope, name=connector.name: self._activate_scope(
+                name, cache_scope
+            )
         self.connectors[1].state_loader = lambda cache_scope: self.store.load_connector_state(
             'jira', cache_scope=cache_scope
         )
+
+    def _activate_scope(self, connector: str, cache_scope: str) -> None:
+        self.store.activate_connector_scope(connector, cache_scope)
+        self._persistence_errors.pop(connector, None)
 
     async def refresh(self) -> None:
         if self._lock.locked():
@@ -40,13 +48,15 @@ class RefreshCoordinator:
                 if result is None:
                     continue
                 try:
+                    if result.cache_scope is not None:
+                        self._activate_scope(result.connector, result.cache_scope)
                     if result.health.state in {"ok", "partial"}:
                         self.store.replace_connector(result, self.settings.app.activity_retention_days)
                         if result.connector == "jira":
                             jira = next(connector for connector in self.connectors if connector.name == "jira")
                             self.store.save_connector_state("jira", jira.checkpoint())
                     else:
-                        self.store.record_health(result.health)
+                        self.store.record_health(result.health, cache_scope=result.cache_scope)
                 except Exception as exc:
                     # Keep failures visible even when SQLite cannot accept a health write.
                     self._persistence_errors[result.connector] = ConnectorHealth(
@@ -62,6 +72,7 @@ class RefreshCoordinator:
                 raise failures[0]
 
     async def _run_connector(self, connector) -> ConnectorResult | None:
+        connector.verified_cache_scope = None
         try:
             if isinstance(connector, JiraConnector):
                 connector.load_state(self.store.load_connector_state("jira"))
@@ -88,7 +99,8 @@ class RefreshCoordinator:
                 error_code=exc.__class__.__name__.upper(),
                 coverage={"diagnostic": safe_error(exc)},
             )
-        return ConnectorResult(connector=connector.name, health=health)
+        return ConnectorResult(connector=connector.name, health=health,
+                               cache_scope=connector.verified_cache_scope)
 
     async def run_periodic(self) -> None:
         while not self._stop.is_set():

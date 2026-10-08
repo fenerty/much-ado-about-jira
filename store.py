@@ -50,6 +50,13 @@ class Store:
             raise ValueError("Verified cache scope does not match the configured source/account")
         return f"{connector}@{cache_scope}"
 
+    def activate_connector_scope(self, connector: str, cache_scope: str) -> None:
+        """Switch visibility after authentication, independently of cache writes."""
+        with self._lock:
+            storage = self._verified_connector(connector, cache_scope)
+            if self._cache_bindings is not None:
+                self._active_connectors[connector] = storage
+
     def _row_data(self, row: sqlite3.Row) -> dict:
         data = json.loads(row['payload_json'])
         data['id'] = row['entity_id']
@@ -335,7 +342,9 @@ class Store:
             ),
         )
 
-    def record_health(self, health: ConnectorHealth) -> None:
+    def record_health(self, health: ConnectorHealth, *, cache_scope: str | None = None) -> None:
+        if cache_scope is not None:
+            self.activate_connector_scope(health.connector, cache_scope)
         with self._lock, self._connect() as connection:
             storage = self._storage_connector(health.connector)
             if storage is not None:

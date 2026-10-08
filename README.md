@@ -55,13 +55,13 @@ The dashboard opens at [localhost:8765](http://127.0.0.1:8765). Both connectors 
 
 Azure DevOps uses the authenticated Azure CLI session to obtain a short-lived delegated token in memory. The HTTP guard permits GET and read-query WIQL POST requests. Jira uses the Atlassian CLI OAuth session with an allowlist of authentication status, issue search/view, and comment-list commands. The app does not create credentials or write to either source system.
 
-Refreshes run every three minutes by default. Each connector retains its last successful snapshot when it fails. API responses are normalized before storage; tokens and full comment bodies are not cached. Cached titles, links, and activity summaries may still contain private work information and stay local.
+Refreshes run every three minutes by default. Each connector retains the verified account's last successful snapshot when it fails. API responses are normalized before storage; tokens and full comment bodies are not cached. Cached titles, links, and activity summaries may still contain private work information and stay local.
 
 ## Local data
 
 SQLite lives in the runtime's user-local application-data area under `MuchADOAboutJira/dashboard.sqlite3`. Microsoft Store Python may use its package-local cache. Activity retention defaults to 60 days. The first connector snapshot is marked seen; later material changes become unread.
 
-Cached work, history progress, and personal read/hidden state are separated by source site or organization and account. Changing sources or accounts does not carry another account’s relationships or hidden entries into the new workspace; returning to the original configuration restores its retained state. When no expected account is configured, saved work is shown only after the connector verifies the current identity.
+Cached work, history progress, and personal read/hidden state are separated by source site or organization and account. Changing sources or accounts does not carry another account’s relationships or hidden entries into the new workspace; returning to the original configuration restores its retained state. When no expected account is configured, saved work is shown only after the connector verifies the current identity. Verification switches the visible workspace immediately, even if the following sync fails; an account without a saved snapshot shows an empty workspace with the sync error.
 
 On upgrade, a single original Jira snapshot can be carried forward when its saved history fingerprint proves the same source and account. Older Jira caches may already mix sources or accounts, and legacy ADO cache labels do not prove account identity. Their ownership cannot be assigned safely: they stay in the local database, separate from the new workspace, whose first successful snapshot establishes a fresh baseline. Keep a backup of the database before upgrades if you need to retain older triage state.
 

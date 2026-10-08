@@ -245,6 +245,10 @@ def test_configured_account_rejects_other_verified_scope_and_checkpoint_reads(tm
         store.replace_connector(other,60)
     with pytest.raises(ValueError,match='does not match'):
         store.load_connector_state('jira',cache_scope=other.cache_scope)
+    with pytest.raises(ValueError,match='does not match'):
+        store.activate_connector_scope('jira',other.cache_scope)
+    with pytest.raises(ValueError,match='does not match'):
+        store.record_health(other.health,cache_scope=other.cache_scope)
     assert store.load()==([],[],[])
 
 
