@@ -66,6 +66,7 @@ class ConnectorHealth(BaseModel):
 
 class ConnectorResult(BaseModel):
     connector: Literal["azure_devops", "jira"]
+    cache_scope: str | None = None
     work_items: list[WorkItem] = Field(default_factory=list)
     activities: list[Activity] = Field(default_factory=list)
     health: ConnectorHealth

@@ -1,7 +1,12 @@
 "use strict";
 const defaultGroups = ['blocked','progress','validation','waiting','scheduled','todo','unknown','done'];
+function isRecord(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 let preferences = {};
-try { preferences = JSON.parse(localStorage.getItem('workspacePreferences') || '{}') || {}; } catch {}
+try {
+  const saved = JSON.parse(localStorage.getItem('workspacePreferences') || '{}');
+  if (isRecord(saved)) preferences = saved;
+} catch {}
+for (const key of ['views', 'helpLimits']) if (!isRecord(preferences[key])) preferences[key] = {};
 const pageSize = () => preferences.showAll ? Infinity : ([30,50,100,250].includes(Number(preferences.pageSize)) ? Number(preferences.pageSize) : 30);
 const groupOrder = () => [...new Set([...(Array.isArray(preferences.groupOrder) ? preferences.groupOrder.filter(key => defaultGroups.includes(key)) : []),...defaultGroups])];
 const collapsed = () => Array.isArray(preferences.collapsed) ? preferences.collapsed : [];
@@ -15,17 +20,16 @@ const views = {
 };
 const viewGuides = {
   updates: ["What changed?", "All updates shows each captured change, comment, mention, or reply. Latest per item shows the newest update per item that matches your filters. Switching modes preserves all updates.", "Mark read reads this update; an older unread update may appear next in Latest per item. Read all for item reads all current updates for the same item, including filtered or hidden updates. New updates still arrive unread. Read updates remain in the inbox when Unread only is off. Hide moves updates to Hidden without changing read state; Undo or Restore brings them back."],
-  work: ["What am I keeping track of?", "One row per discovered ticket or PR related to you: assigned now or previously, created, followed, or discussed. It stays here after handoff or completion; there is no age cutoff after discovery.", "Status badges use the source’s wording. Mark read also reads all current updates for that item. Mark unread affects only the selected rows. New updates still arrive unread. Last known means the latest sync did not retrieve that item, so its status may have changed."],
+  work: ["What am I keeping track of?", "One row per discovered ticket or PR related to you: assigned now or previously, created, followed, or discussed. It stays here after handoff or completion; there is no age cutoff after discovery.", "Status badges use the source’s wording. Hide keeps an item out of My work until you restore it from Hidden; its updates stay available. Manage read and unread state in Updates. Last known means the latest sync did not retrieve that item, so its status may have changed."],
   dismissed: ["What did I hide?", "Updates you hid, and work items you hid from My work. Restore brings back that row and preserves its read state.", "Hiding never stops future updates. If a restored update is read, turn off Unread only in Updates to see it."],
 };
 function rememberView() {
-  preferences.views ||= {};
   preferences.views[state.view] = {query:state.query, source:state.source, unread:state.unread, workFilter:state.workFilter, sort:state.sort, dateMode:state.dateMode, dateAmount:state.dateAmount, dateUnit:state.dateUnit, recentOnly:state.recentOnly, dateOpen:$('#dateFilters').open, limit:Number.isFinite(state.limit) ? state.limit : 'all', selected:[...state.selected]};
   preferences.lastView = state.view;
   savePreferences();
 }
 function restoreView(view) {
-  const saved = preferences.views?.[view] || {};
+  const saved = isRecord(preferences.views[view]) ? preferences.views[view] : {};
   state.view = view;
   state.updatesDisplayMode = preferences.updatesDisplayMode === 'latest_per_item' ? 'latest_per_item' : 'all';
   state.query = typeof saved.query === 'string' ? saved.query : '';
@@ -72,7 +76,7 @@ function statusInfo(item) {
   if (item.status_category === "todo" || /new|open|ready|backlog|to do/.test(label)) return [5,"todo","To do"];
   return [5.5,"unknown","Other / unknown"];
 }
-function needsReview(item) { return item.status_category !== "done" && !item.metadata?.snapshot_only && item.reasons?.includes("reviewer") && (item.metadata?.reviewer_vote ?? 0) === 0 && item.status !== "Draft"; }
+function needsReview(item) { return Boolean(item && item.status_category !== "done" && !item.metadata?.snapshot_only && item.reasons?.includes("reviewer") && (item.metadata?.reviewer_vote ?? 0) === 0 && item.status !== "Draft"); }
 function unique(items) { return [...new Map(items.map(item => [item.id, item])).values()]; }
 function statusItemFor(item) { return item.entity_kind === 'activity' ? state.workById.get(item.item_id) : item; }
 function hasNoRecentChanges(item) {
@@ -154,7 +158,7 @@ function rowTemplate(item) {
     <label class="row-select"><input type="checkbox" data-select="${escapeHtml(item.id)}" aria-label="Select ${escapeHtml(key)}" ${state.selected.has(item.id) ? "checked" : ""} ${state.view !== "updates" ? "hidden" : ""}><span class="read-label">${state.view !== "updates" ? "" : item.unread ? "Unread" : "Read"}</span></label>
     <a class="row-main" href="${escapeHtml(safeUrl(item.url))}" target="_blank" rel="noopener noreferrer">
       <div class="row-title-line"><span class="row-key">${escapeHtml(key)}</span><span class="row-title">${escapeHtml(item.title || item.item_title)}</span></div>
-      <div class="row-meta"><span class="source-badge">${sourceLabel(item.source)}</span>${item.entity_kind === "activity" ? '<span class="event-label">Event</span>' : ""}${primaryReason ? `<span class="reason-badge" title="${escapeHtml(reasonHelp[primaryReason] || reasonLabel(primaryReason))}">${escapeHtml(primaryReason === "reviewer" && needsReview(item) ? "Needs your review" : reasonLabel(primaryReason))}</span>` : ""}${flags.join("")}<span>${escapeHtml(item.repository || item.project || item.actor || "")}</span>${description ? `<span>${escapeHtml(description)}</span>` : ""}</div>
+      <div class="row-meta"><span class="source-badge">${sourceLabel(item.source)}</span>${item.entity_kind === "activity" ? '<span class="event-label">Event</span>' : ""}${primaryReason ? `<span class="reason-badge" title="${escapeHtml(reasonHelp[primaryReason] || reasonLabel(primaryReason))}">${escapeHtml(primaryReason === "reviewer" && needsReview(statusItem) ? "Needs your review" : reasonLabel(primaryReason))}</span>` : ""}${flags.join("")}<span>${escapeHtml(item.repository || item.project || item.actor || "")}</span>${description ? `<span>${escapeHtml(description)}</span>` : ""}</div>
       ${eventDetails}
     </a><div class="row-side"><span class="age" title="${escapeHtml(timestamp ? new Date(timestamp).toLocaleString() : "Not available")}">${escapeHtml(relativeTime(timestamp))}</span><div class="row-actions">${rowActions}</div></div></article>`;
 }
@@ -225,9 +229,10 @@ function render() {
   const expanded = filtered.filter(item => state.view !== "work" || state.sort !== "status" || !collapsed().includes(statusInfo(item)[1]));
   const visible = expanded.slice(0, state.limit);
   const visibleIds = new Set(visible.map(item => item.id));
-  state.selected = new Set([...state.selected].filter(id => filtered.some(item => item.id === id)));
+  const matchingIds = new Set(filtered.map(item => item.id));
+  state.selected = new Set([...state.selected].filter(id => matchingIds.has(id)));
   $("#batchBar").hidden = state.view !== "updates";
-  $("#selectionCount").textContent = `${state.selected.size} selected${state.selected.size > visible.length ? " (includes rows not displayed)" : ""}`;
+  $("#selectionCount").textContent = `${state.selected.size} selected${[...state.selected].some(id => !visibleIds.has(id)) ? " (includes rows not displayed)" : ""}`;
   $("#selectMatching").textContent = `Select all ${filtered.length} matching rows`;
   $("#selectVisible").checked = visible.length > 0 && visible.every(item => state.selected.has(item.id));
   $("#selectVisible").indeterminate = state.selected.size > 0 && !visible.every(item => state.selected.has(item.id));
@@ -289,7 +294,7 @@ async function applyAction(entityId, action) {
       $("#undoMessage").textContent = action === "hide_work" ? "Item hidden from My work. Its updates remain available. Restore it from Hidden anytime." : `${data.undo_entries.length} update(s) hidden. Your work and future updates are unaffected.`;
       $("#undoBanner").hidden = false;
     }
-  } catch(error) { showError(error); } finally { state.mutating = false; }
+  } catch(error) { showError(error); } finally { state.mutating = false; render(); }
 }
 document.addEventListener("click", async event => {
   const viewButton = event.target.closest("[data-view]");
@@ -323,7 +328,7 @@ $("#undoDismiss").addEventListener("click", async () => {
   try {
     await requestDashboard("/api/undo-dismiss", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({entries:state.undoEntries})});
     state.undoEntries = []; $("#undoBanner").hidden = true;
-  } catch(error) { showError(error); } finally { state.mutating = false; }
+  } catch(error) { showError(error); } finally { state.mutating = false; render(); }
 });
 $("#workSort").addEventListener("change", event => { state.sort = event.target.value; state.selected.clear(); render(); });
 $('#updatesDisplay').addEventListener('change', event => {
@@ -358,7 +363,10 @@ document.addEventListener("change", event => {
   if (id) { if (event.target.checked) state.selected.add(id); else state.selected.delete(id); render(); }
 });
 $("#selectVisible").addEventListener("change", event => {
-  state.selected = new Set(event.target.checked ? [...document.querySelectorAll("[data-select]")].map(input => input.dataset.select) : []); render();
+  for (const input of document.querySelectorAll("[data-select]")) {
+    if (event.target.checked) state.selected.add(input.dataset.select); else state.selected.delete(input.dataset.select);
+  }
+  render();
 });
 async function batchRead(action) {
   if (state.mutating || !state.selected.size) return;

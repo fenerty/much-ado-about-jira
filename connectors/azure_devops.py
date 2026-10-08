@@ -8,13 +8,13 @@ import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import httpx
 
 from activity_details import ado_changes
-from config import AzureDevOpsSettings
+from config import AzureDevOpsSettings, source_scope
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_ado_read_operation, safe_error
 from .base import completed_within, CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
@@ -31,14 +31,25 @@ class AzureDevOpsConnector:
         self.settings = settings
         self.timeout_seconds = timeout_seconds
         self._history_cache = {}
+        self._history_cache_scope: str | None = None
+        self.scope_verified: Callable[[str], None] | None = None
+        self.verified_cache_scope: str | None = None
 
     async def refresh(self) -> ConnectorResult:
+        self.verified_cache_scope = None
         attempted = utc_now()
         if not self.settings.enabled:
             return self._result("disabled", "Azure DevOps connector is disabled", attempted)
         try:
             executable = self._find_cli()
-            account, token = await asyncio.to_thread(self._authenticate, executable)
+            account = await asyncio.to_thread(self._authenticate, executable)
+            self.verified_cache_scope = source_scope(self.name, self.settings.organization, account)
+            if self._history_cache_scope != self.verified_cache_scope:
+                self._history_cache.clear()
+                self._history_cache_scope = self.verified_cache_scope
+            if self.scope_verified is not None:
+                self.scope_verified(self.verified_cache_scope)
+            token = await asyncio.to_thread(self._access_token, executable)
             async with httpx.AsyncClient(
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                 timeout=self.timeout_seconds,
@@ -61,6 +72,7 @@ class AzureDevOpsConnector:
                 message = "Azure DevOps refreshed with incomplete work-item or PR coverage"
             return ConnectorResult(
                 connector=self.name,
+                cache_scope=self.verified_cache_scope,
                 work_items=work_items,
                 activities=activities,
                 health=ConnectorHealth(
@@ -87,9 +99,13 @@ class AzureDevOpsConnector:
                 str(exc),
                 attempted,
                 exc.code,
+                cache_scope=self.verified_cache_scope,
             )
         except (httpx.HTTPError, ValueError, OSError) as exc:
-            return self._result("error", "Azure DevOps read failed", attempted, exc.__class__.__name__, exc)
+            return self._result(
+                "error", "Azure DevOps read failed", attempted, exc.__class__.__name__, exc,
+                cache_scope=self.verified_cache_scope,
+            )
 
     def _result(
         self,
@@ -98,12 +114,15 @@ class AzureDevOpsConnector:
         attempted: datetime,
         code: str | None = None,
         diagnostic: Exception | None = None,
+        *,
+        cache_scope: str | None = None,
     ) -> ConnectorResult:
         coverage = {"organization": self.settings.organization}
         if diagnostic:
             coverage["diagnostic"] = safe_error(diagnostic)
         return ConnectorResult(
             connector=self.name,
+            cache_scope=cache_scope,
             health=ConnectorHealth(
                 connector=self.name,
                 state=state,
@@ -129,7 +148,7 @@ class AzureDevOpsConnector:
             return executable
         return local_cli_bridge("az")
 
-    def _authenticate(self, executable: str | CommandSpec) -> tuple[str, str]:
+    def _authenticate(self, executable: str | CommandSpec) -> str:
         account_result = run_command(
             executable, ["account", "show", "--output", "json", "--only-show-errors"], self.timeout_seconds
         )
@@ -142,7 +161,9 @@ class AzureDevOpsConnector:
         account_data = parse_json_output(account_result.stdout)
         account = str((account_data.get("user") or {}).get("name") or "")
         self._verify_identity(account)
+        return account
 
+    def _access_token(self, executable: str | CommandSpec) -> str:
         token_result = run_command(
             executable,
             [
@@ -165,9 +186,15 @@ class AzureDevOpsConnector:
                 "Azure CLI could not obtain a delegated Azure DevOps token; sign in again",
                 auth_required=True,
             )
-        return account, token
+        return token
 
     def _verify_identity(self, actual: str) -> None:
+        if not actual.strip():
+            raise ConnectorFailure(
+                "IDENTITY_UNAVAILABLE",
+                "Azure CLI did not expose an account",
+                auth_required=True,
+            )
         expected = self.settings.expected_account.strip().lower()
         if expected and actual.strip().lower() != expected:
             raise ConnectorFailure(
@@ -610,9 +637,10 @@ class AzureDevOpsConnector:
             for status in statuses_data.get("value") or []
             if str(status.get("state") or "").lower() in {"failed", "error"}
         )
-        if vote < 0 and "author" in roles:
+        requested_changes = any(int(reviewer.get("vote") or 0) < 0 for reviewer in reviewers)
+        if requested_changes and "author" in roles:
             reasons.append("requested_changes")
-        actionable = ("reviewer" in roles and vote == 0) or ("author" in roles and (vote < 0 or failed_checks > 0))
+        actionable = ("reviewer" in roles and vote == 0) or ("author" in roles and (requested_changes or failed_checks > 0))
         actionable = actionable or (unresolved > 0 and "participant" in reasons)
         item = WorkItem(
             id=f"azure_repos:pr:{repo_id}:{pr_id}",

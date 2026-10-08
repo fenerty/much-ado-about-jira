@@ -10,10 +10,10 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
-from config import JiraSettings
+from config import JiraSettings, source_scope
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_jira_read_command, safe_error
 from .base import CommandSpec, ConnectorFailure, async_run_command, display_name, local_cli_bridge, parse_datetime, parse_json_output, unique_strings
@@ -32,6 +32,9 @@ class JiraConnector:
         self._fresh_roles: dict[str, set[str]] = {}
         self._verified_history_roles: dict[str, set[str]] = {}
         self._enrichment_failures: list[str] = []
+        self.state_loader = None
+        self.scope_verified: Callable[[str], None] | None = None
+        self.verified_cache_scope: str | None = None
 
     def load_state(self, state: dict) -> None:
         self._saved_state = state
@@ -53,6 +56,7 @@ class JiraConnector:
             self._history = JiraHistory(scope, self._saved_state)
 
     async def refresh(self) -> ConnectorResult:
+        self.verified_cache_scope = None
         attempted = utc_now()
         if not self.settings.enabled:
             return self._result("disabled", "Jira connector is disabled", attempted)
@@ -62,6 +66,11 @@ class JiraConnector:
         try:
             executable = self._find_cli()
             identity = await self._authenticate(executable)
+            self.verified_cache_scope = source_scope(self.name, identity["site"], identity["email"])
+            if self.scope_verified is not None:
+                self.scope_verified(self.verified_cache_scope)
+            if self.state_loader is not None:
+                self.load_state(self.state_loader(self.verified_cache_scope))
             candidates, query_roles, partial_queries = await self._query_candidates(executable, identity, include_history=False)
             records, hydrate_failures = await self._hydrate_candidates(executable, candidates, include_history=False)
             partial_queries.extend(hydrate_failures)
@@ -84,6 +93,7 @@ class JiraConnector:
                     message = "Jira refreshed; older history discovery and details advance in saved batches"
             return ConnectorResult(
                 connector=self.name,
+                cache_scope=self.verified_cache_scope,
                 work_items=items,
                 activities=activities,
                 health=ConnectorHealth(
@@ -113,9 +123,13 @@ class JiraConnector:
                 str(exc),
                 attempted,
                 exc.code,
+                cache_scope=self.verified_cache_scope,
             )
         except (ValueError, OSError) as exc:
-            return self._result("error", "Jira read failed", attempted, exc.__class__.__name__, exc)
+            return self._result(
+                "error", "Jira read failed", attempted, exc.__class__.__name__, exc,
+                cache_scope=self.verified_cache_scope,
+            )
 
     def _result(
         self,
@@ -124,12 +138,15 @@ class JiraConnector:
         attempted: datetime,
         code: str | None = None,
         diagnostic: Exception | None = None,
+        *,
+        cache_scope: str | None = None,
     ) -> ConnectorResult:
         coverage: dict[str, Any] = {"site": self.settings.site}
         if diagnostic:
             coverage["diagnostic"] = safe_error(diagnostic)
         return ConnectorResult(
             connector=self.name,
+            cache_scope=cache_scope,
             health=ConnectorHealth(
                 connector=self.name,
                 state=state,
@@ -203,17 +220,17 @@ class JiraConnector:
                 identity["site"] = str(data.get("site") or "")
         except ValueError:
             pass
-        email = re.search(r"(?im)^\s*Email:\s*(\S+)", output)
-        site = re.search(r"(?im)^\s*Site:\s*(\S+)", output)
+        email = re.search(r"(?im)^[ \t]*Email:[ \t]*(\S+)", output)
+        site = re.search(r"(?im)^[ \t]*Site:[ \t]*(\S+)", output)
         if email:
             identity["email"] = email.group(1).lower()
         if site:
             identity["site"] = site.group(1)
         configured_site = urlparse(self.settings.site).hostname or self.settings.site
         actual_site = urlparse("https://" + identity["site"].removeprefix("https://").rstrip("/")).hostname
+        identity["email"] = identity["email"].strip().lower()
         if not identity["email"] or not actual_site:
             raise ConnectorFailure("IDENTITY_UNAVAILABLE", "Atlassian CLI did not expose an account and site", auth_required=True)
-        identity["email"] = identity["email"].strip().lower()
         if expected and identity["email"] != expected:
             raise ConnectorFailure(
                 "IDENTITY_MISMATCH",
@@ -634,14 +651,17 @@ class JiraConnector:
 
     @staticmethod
     def _is_self(author: dict[str, Any], identity: dict[str, str]) -> bool:
-        account_id = str(author.get("accountId") or "").lower()
-        email = str(author.get("emailAddress") or "").lower()
-        name = str(author.get("displayName") or "").lower()
-        return bool(
-            (identity.get("account_id") and account_id == identity["account_id"].lower())
-            or (identity.get("email") and email == identity["email"].lower())
-            or (identity.get("display_name") and name == identity["display_name"].lower())
-        )
+        account_id = str(author.get("accountId") or "").strip().lower()
+        self_account_id = str(identity.get("account_id") or "").strip().lower()
+        if account_id and self_account_id:
+            return account_id == self_account_id
+        email = str(author.get("emailAddress") or "").strip().lower()
+        self_email = str(identity.get("email") or "").strip().lower()
+        if email and self_email:
+            return email == self_email
+        name = str(author.get("displayName") or "").strip().lower()
+        self_name = str(identity.get("display_name") or "").strip().lower()
+        return bool(name and self_name and name == self_name)
 
     @staticmethod
     def _adf_text_and_mentions(value: Any) -> tuple[str, list[str]]:
@@ -675,13 +695,19 @@ class JiraConnector:
 
     @staticmethod
     def _status_category(status: str, category: str) -> str:
-        combined = f"{status} {category}".lower()
-        if any(word in combined for word in ("done", "closed", "resolved", "complete")):
+        status_name = " ".join(status.lower().split())
+        category_name = " ".join(category.lower().split())
+        source_category = {"done": "done", "in progress": "in_progress", "to do": "todo"}.get(category_name)
+        if source_category == "done":
             return "done"
-        if "block" in combined or "pending" in combined:
+        if re.search(r"\b(?:blocked|pending)\b", status_name):
             return "blocked"
-        if any(word in combined for word in ("progress", "implement", "develop", "review")):
+        if source_category:
+            return source_category
+        if status_name in {"done", "closed", "resolved", "complete", "completed"}:
+            return "done"
+        if status_name in {"in progress", "implementing", "implementation", "developing", "development", "in review", "review"}:
             return "in_progress"
-        if any(word in combined for word in ("to do", "open", "ready", "new", "backlog")):
+        if status_name in {"to do", "open", "ready", "new", "backlog"}:
             return "todo"
         return "other"

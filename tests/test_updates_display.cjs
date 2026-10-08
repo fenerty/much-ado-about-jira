@@ -5,17 +5,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../static/app.js'), 'utf8');
 function setup(saved = {}) {
-  const elements = new Map();
+  const elements = new Map(), selectorRows = new Map();
   const element = key => {
     if (!elements.has(key)) elements.set(key, {dataset:{}, value:'', listeners:{}, addEventListener(name, fn) { this.listeners[name] = fn; }, setAttribute(){}, removeAttribute(){}});
     return elements.get(key);
   };
   let storage = JSON.stringify(saved);
-  const context = vm.createContext({console, URL, Intl, Date, setInterval(){}, fetch:() => new Promise(() => {}), localStorage:{getItem:() => storage, setItem:(_, value) => {storage = value;}}, document:{querySelector:element, querySelectorAll:() => [], addEventListener(){}}});
+  const context = vm.createContext({console, URL, Intl, Date, setInterval(){}, fetch:() => new Promise(() => {}), localStorage:{getItem:() => storage, setItem:(_, value) => {storage = value;}}, document:{querySelector:element, querySelectorAll:selector => selectorRows.get(selector) || [], addEventListener(){}}});
   vm.runInContext(source, context);
   const run = code => vm.runInContext(code, context);
   run(`state.dashboard = {activity:[], dismissed:[], tracked_items:[], my_work:{}, code:{}, following_waiting:[], summary:{assigned:0}, health:{}}; state.unread=false;`);
-  return {run, element, saved:() => JSON.parse(storage), ids:() => JSON.parse(run('JSON.stringify(matchingRows(state.dashboard.activity).map(x => x.id))'))};
+  return {run, element, queryAll:(selector, rows) => selectorRows.set(selector, rows), setFetch:handler => {context.fetch = handler;}, saved:() => JSON.parse(storage), ids:() => JSON.parse(run('JSON.stringify(matchingRows(state.dashboard.activity).map(x => x.id))'))};
 }
 const event = (id, parent, date, extra = {}) => ({id, item_id:parent, timestamp:date, entity_kind:'activity', unread:true, source:'jira', item_key:parent, item_title:'Example', url:'https://example.test', ...extra});
 const seed = (ui, events) => ui.run(`state.dashboard.activity = ${JSON.stringify(events)}; render();`);
@@ -102,4 +102,78 @@ test('recent activity excludes stale or unverified parents before grouping', () 
   seed(ui,[event('recent','A','2026-09-15'),event('stale','B','2026-09-15'),event('unknown','C','2026-09-15')]);
   ui.run(`state.dashboard.tracked_items = [{id:'A', updated_at:new Date().toISOString()}, {id:'B',updated_at:'2000-01-01'}]; state.recentOnly=true; render()`);
   assert.deepEqual(ui.ids(),['recent']);
+});
+
+
+test('reviewer update badges use verified current parent state', () => {
+  const ui = setup();
+  const parent = {id:'pr:A', entity_kind:'work_item', status:'Active', status_category:'in_progress', reasons:['reviewer'], metadata:{reviewer_vote:0}};
+  seed(ui, [event('update','pr:A','2026-09-15',{source:'azure_repos',reasons:['reviewer']})]);
+  for (const [extra, pending] of [
+    [{},true],
+    [{status:'Completed',status_category:'done'},false],
+    [{metadata:{reviewer_vote:10}},false],
+    [{status:'Draft'},false],
+    [{metadata:{reviewer_vote:0,snapshot_only:true}},false],
+    [null,false],
+  ]) {
+    ui.run(`state.dashboard.tracked_items=${JSON.stringify(extra === null ? [] : [{...parent,...extra}])};render()`);
+    assert.equal(ui.element('#workList').innerHTML.includes('Needs your review'),pending);
+  }
+});
+
+test('displayed selection adds and removes only displayed IDs across pages', () => {
+  const ui = setup();
+  seed(ui, Array.from({length:35},(_,i) => event(`e${i}`,`p${i}`,'2026-09-15')));
+  ui.queryAll('[data-select]',Array.from({length:30},(_,i) => ({dataset:{select:`e${i}`}})));
+  ui.element('#selectMatching').listeners.click();
+  ui.element('#selectVisible').listeners.change({target:{checked:false}});
+  assert.equal(ui.run('state.selected.size'),5);
+  assert.equal(ui.run("[...state.selected].every(id => Number(id.slice(1)) >= 30)"),true);
+  ui.element('#selectVisible').listeners.change({target:{checked:true}});
+  assert.equal(ui.run('state.selected.size'),35);
+  ui.run("state.selected=new Set(['e34','missing']);render()");
+  assert.equal(ui.run('state.selected.size'),1);
+  assert.match(ui.element('#selectionCount').textContent,/includes rows not displayed/);
+});
+
+test('single actions and undo re-enable batch controls after success and failure', async () => {
+  const ui = setup();
+  seed(ui,[event('selected','A','2026-09-15'),event('other','B','2026-09-15')]);
+  ui.run("state.selected.add('selected');render()");
+  ui.setFetch(async () => ({ok:true,json:async () => JSON.parse(ui.run('JSON.stringify(state.dashboard)'))}));
+  await ui.run("applyAction('other','seen')");
+  assert.equal(ui.element('#batchRead').disabled,false);
+  assert.equal(ui.element('#batchUnread').disabled,false);
+  ui.run("state.undoEntries=[{entity_id:'other',version:'synthetic'}]");
+  await ui.element('#undoDismiss').listeners.click();
+  assert.equal(ui.element('#batchRead').disabled,false);
+  ui.setFetch(async () => {throw new Error('Synthetic request failure');});
+  await ui.run("applyAction('other','seen')");
+  assert.equal(ui.element('#batchRead').disabled,false);
+  assert.equal(ui.run('state.mutating'),false);
+  assert.match(ui.element('#actionNotice').textContent,/Synthetic request failure/);
+  ui.run("state.undoEntries=[{entity_id:'other',version:'synthetic'}]");
+  await ui.element('#undoDismiss').listeners.click();
+  assert.equal(ui.element('#batchRead').disabled,false);
+  assert.equal(ui.run('state.undoEntries.length'),1);
+});
+
+test('invalid preference object shapes fall back without breaking rendering', () => {
+  for (const saved of [42,'hello',[],null,{views:42},{views:[],helpLimits:42},{views:{updates:42}}]) {
+    const ui = setup(saved);
+    seed(ui,[]);
+    assert.equal(ui.run('state.view'),'updates');
+    assert.equal(typeof ui.saved().views,'object');
+    assert.equal(Array.isArray(ui.saved().views),false);
+    assert.equal(typeof ui.saved().helpLimits,'object');
+    assert.equal(Array.isArray(ui.saved().helpLimits),false);
+  }
+});
+
+test('My work help describes inventory and available controls', () => {
+  const ui = setup();
+  ui.run("restoreView('work');render()");
+  assert.doesNotMatch(ui.element('#viewGuide').innerHTML,/Mark read|Mark unread/);
+  assert.match(ui.element('#viewGuide').innerHTML,/restore it from Hidden/);
 });
