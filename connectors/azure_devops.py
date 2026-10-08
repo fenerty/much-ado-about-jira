@@ -14,7 +14,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_details import ado_changes
-from config import AzureDevOpsSettings
+from config import AzureDevOpsSettings, source_scope
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_ado_read_operation, safe_error
 from .base import completed_within, CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
@@ -61,6 +61,7 @@ class AzureDevOpsConnector:
                 message = "Azure DevOps refreshed with incomplete work-item or PR coverage"
             return ConnectorResult(
                 connector=self.name,
+                cache_scope=source_scope(self.name, self.settings.organization, account),
                 work_items=work_items,
                 activities=activities,
                 health=ConnectorHealth(
@@ -610,9 +611,10 @@ class AzureDevOpsConnector:
             for status in statuses_data.get("value") or []
             if str(status.get("state") or "").lower() in {"failed", "error"}
         )
-        if vote < 0 and "author" in roles:
+        requested_changes = any(int(reviewer.get("vote") or 0) < 0 for reviewer in reviewers)
+        if requested_changes and "author" in roles:
             reasons.append("requested_changes")
-        actionable = ("reviewer" in roles and vote == 0) or ("author" in roles and (vote < 0 or failed_checks > 0))
+        actionable = ("reviewer" in roles and vote == 0) or ("author" in roles and (requested_changes or failed_checks > 0))
         actionable = actionable or (unresolved > 0 and "participant" in reasons)
         item = WorkItem(
             id=f"azure_repos:pr:{repo_id}:{pr_id}",

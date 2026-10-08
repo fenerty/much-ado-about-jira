@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 from config import Settings
@@ -17,10 +18,14 @@ class RefreshCoordinator:
         self.store = store
         self._lock = asyncio.Lock()
         self._stop = asyncio.Event()
+        self._persistence_errors: dict[str, ConnectorHealth] = {}
         self.connectors = [
             AzureDevOpsConnector(settings.azure_devops, settings.app.connector_timeout_seconds),
             JiraConnector(settings.jira, settings.app.connector_timeout_seconds),
         ]
+        self.connectors[1].state_loader = lambda cache_scope: self.store.load_connector_state(
+            'jira', cache_scope=cache_scope
+        )
 
     async def refresh(self) -> None:
         if self._lock.locked():
@@ -30,8 +35,11 @@ class RefreshCoordinator:
             results = await asyncio.gather(
                 *(self._run_connector(connector) for connector in self.connectors)
             )
+            failures = []
             for result in results:
-                if result is not None:
+                if result is None:
+                    continue
+                try:
                     if result.health.state in {"ok", "partial"}:
                         self.store.replace_connector(result, self.settings.app.activity_retention_days)
                         if result.connector == "jira":
@@ -39,6 +47,19 @@ class RefreshCoordinator:
                             self.store.save_connector_state("jira", jira.checkpoint())
                     else:
                         self.store.record_health(result.health)
+                except Exception as exc:
+                    # Keep failures visible even when SQLite cannot accept a health write.
+                    self._persistence_errors[result.connector] = ConnectorHealth(
+                        connector=result.connector, state='error',
+                        message='Local cache or refresh progress could not be saved; automatic refresh will retry',
+                        last_attempt_at=datetime.now(timezone.utc), error_code='CACHE_WRITE_FAILED',
+                        coverage={'diagnostic': safe_error(exc)},
+                    )
+                    failures.append(exc)
+                else:
+                    self._persistence_errors.pop(result.connector, None)
+            if failures:
+                raise failures[0]
 
     async def _run_connector(self, connector) -> ConnectorResult | None:
         try:
@@ -67,12 +88,15 @@ class RefreshCoordinator:
                 error_code=exc.__class__.__name__.upper(),
                 coverage={"diagnostic": safe_error(exc)},
             )
-        self.store.record_health(health)
-        return None
+        return ConnectorResult(connector=connector.name, health=health)
 
     async def run_periodic(self) -> None:
         while not self._stop.is_set():
-            await self.refresh()
+            try:
+                await self.refresh()
+            except Exception:
+                # A transient storage failure must not terminate automatic syncing.
+                logging.exception('Dashboard refresh failed; retrying after the refresh interval')
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=self.settings.app.refresh_seconds
@@ -85,6 +109,13 @@ class RefreshCoordinator:
 
     def dashboard(self) -> dict:
         work_items, activities, health = self.store.load()
+        health_by_name = {entry.connector: entry for entry in health}
+        for name, failure in self._persistence_errors.items():
+            previous = health_by_name.get(name)
+            health_by_name[name] = failure.model_copy(update={
+                'last_success_at': previous.last_success_at if previous else None,
+            })
+        health = list(health_by_name.values())
         dashboard = build_dashboard(
             work_items, activities, health, self.settings.app.stale_after_days
         )

@@ -10,17 +10,106 @@ from pathlib import Path
 from typing import Literal
 
 from activity_details import snapshot_changes
+from config import source_realm
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 
 
 class Store:
-    def __init__(self, database_path: Path):
+    def __init__(self, database_path: Path, cache_bindings: dict[str, dict] | None = None):
         self.database_path = database_path
         self._lock = threading.RLock()
+        self._cache_bindings = None if cache_bindings is None else {
+            name: dict(binding) for name, binding in cache_bindings.items()
+        }
+        self._active_connectors = {} if self._cache_bindings is None else {
+            name: f"{name}@{binding['scope']}" for name, binding in self._cache_bindings.items()
+        }
+
+    def _storage_connector(self, connector: str) -> str | None:
+        return connector if self._cache_bindings is None else self._active_connectors.get(connector)
+
+    def _entity_id(self, connector: str, raw_id: str) -> str:
+        return raw_id if self._cache_bindings is None else f"{connector}:{raw_id}"
+
+    def _scope_filter(self, alias: str = "") -> tuple[str, tuple]:
+        if self._cache_bindings is None:
+            return "1 = 1", ()
+        connectors = tuple(self._active_connectors.values())
+        if not connectors:
+            return "0 = 1", ()
+        column = f"{alias}.connector" if alias else "connector"
+        return f"{column} IN ({','.join('?' for _ in connectors)})", connectors
+
+    def _verified_connector(self, connector: str, cache_scope: str | None) -> str:
+        if self._cache_bindings is None:
+            return connector
+        binding = self._cache_bindings.get(connector)
+        if binding is None or not cache_scope or cache_scope.startswith('unverified:'):
+            raise ValueError("A configured connector and verified cache scope are required")
+        if not binding['scope'].startswith('unverified:') and cache_scope != binding['scope']:
+            raise ValueError("Verified cache scope does not match the configured source/account")
+        return f"{connector}@{cache_scope}"
+
+    def _row_data(self, row: sqlite3.Row) -> dict:
+        data = json.loads(row['payload_json'])
+        data['id'] = row['entity_id']
+        if row['entity_kind'] == 'activity':
+            data['item_id'] = self._entity_id(row['connector'], data['item_id'])
+        return data
+
+    def _adopt_legacy(self, connection: sqlite3.Connection) -> None:
+        """Adopt only a first Jira snapshot with verified saved identity proof."""
+        if self._cache_bindings is None:
+            return
+        connection.execute('BEGIN IMMEDIATE')
+        for connector, binding in self._cache_bindings.items():
+            # Old ADO health could contain a display name rather than the login
+            # account. Preserve those rows without assigning them an identity.
+            if connector != 'jira':
+                continue
+            account = str(binding.get('account') or '').strip().lower()
+            if not account or binding['scope'].startswith('unverified:'):
+                continue
+            storage = self._active_connectors[connector]
+            prefix = storage + ':'
+            if (connection.execute('SELECT 1 FROM entities WHERE connector = ? LIMIT 1', (storage,)).fetchone()
+                    or connection.execute('SELECT 1 FROM local_state WHERE substr(entity_id, 1, ?) = ? LIMIT 1', (len(prefix), prefix)).fetchone()
+                    or connection.execute('SELECT 1 FROM connector_runs WHERE connector = ?', (storage,)).fetchone()
+                    or connection.execute('SELECT 1 FROM app_meta WHERE key IN (?, ?)', (f'baseline:{storage}', f'connector_state:{storage}')).fetchone()):
+                continue
+            previous = connection.execute('SELECT health_json FROM connector_runs WHERE connector = ?', (connector,)).fetchone()
+            baseline = connection.execute('SELECT value FROM app_meta WHERE key = ?', (f'baseline:{connector}',)).fetchone()
+            rows = connection.execute('SELECT entity_id, entity_kind, active, first_seen_at, last_seen_at FROM entities WHERE connector = ?', (connector,)).fetchall()
+            # A latest health/checkpoint cannot prove older retained rows belong to
+            # the same source/account. Only an untouched first snapshot is safe.
+            if (previous is None or baseline is None or not rows
+                    or any(row['first_seen_at'] != baseline['value'] or row['last_seen_at'] != baseline['value']
+                           or (row['entity_kind'] == 'work_item' and not row['active']) for row in rows)):
+                continue
+            try:
+                coverage = json.loads(previous['health_json']).get('coverage', {})
+                if not isinstance(coverage, dict):
+                    continue
+                checkpoint = connection.execute('SELECT value FROM app_meta WHERE key = ?', (f'connector_state:{connector}',)).fetchone()
+                state = json.loads(checkpoint['value']) if checkpoint else {}
+                proven = (source_realm(connector, str(coverage.get('site') or '')) == binding['realm']
+                          and isinstance(state, dict) and bool(binding.get('legacy_history_scope'))
+                          and state.get('scope') == binding['legacy_history_scope'])
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if not proven:
+                continue
+            for row in rows:
+                qualified = self._entity_id(storage, row['entity_id'])
+                connection.execute('UPDATE local_state SET entity_id = ? WHERE entity_id = ?', (qualified, row['entity_id']))
+                connection.execute('UPDATE entities SET entity_id = ?, connector = ? WHERE entity_id = ?', (qualified, storage, row['entity_id']))
+            connection.execute('UPDATE connector_runs SET connector = ? WHERE connector = ?', (storage, connector))
+            for category in ('baseline', 'connector_state'):
+                connection.execute('UPDATE app_meta SET key = ? WHERE key = ?', (f'{category}:{storage}', f'{category}:{connector}'))
 
     def initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._lock, self._connect() as connection:
             connection.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -56,18 +145,23 @@ class Store:
                 );
                 """
             )
+            self._adopt_legacy(connection)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=15)
         connection.row_factory = sqlite3.Row
         return connection
 
-    def load_connector_state(self, connector: str) -> dict:
-        """Return a connector's durable refresh progress, or a clean fallback."""
+    def load_connector_state(self, connector: str, *, cache_scope: str | None = None) -> dict:
+        """Read active progress, or a verified namespace without activating it."""
         with self._lock, self._connect() as connection:
+            storage = (self._verified_connector(connector, cache_scope) if cache_scope is not None
+                       else self._storage_connector(connector))
+            if storage is None:
+                return {}
             row = connection.execute(
                 "SELECT value FROM app_meta WHERE key = ?",
-                (f"connector_state:{connector}",),
+                (f"connector_state:{storage}",),
             ).fetchone()
         if row is None:
             return {}
@@ -83,12 +177,15 @@ class Store:
             raise TypeError("Connector state must be a dictionary")
         payload = json.dumps(state, sort_keys=True)
         with self._lock, self._connect() as connection:
+            storage = self._storage_connector(connector)
+            if storage is None:
+                raise ValueError("Connector is not configured")
             connection.execute(
                 """
                 INSERT INTO app_meta(key, value) VALUES(?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
-                (f"connector_state:{connector}", payload),
+                (f"connector_state:{storage}", payload),
             )
 
     @staticmethod
@@ -110,78 +207,84 @@ class Store:
 
     def replace_connector(self, result: ConnectorResult, retention_days: int) -> None:
         now = utc_now().isoformat()
-        baseline_key = f"baseline:{result.connector}"
-        with self._lock, self._connect() as connection:
-            baseline = connection.execute(
-                "SELECT value FROM app_meta WHERE key = ?", (baseline_key,)
-            ).fetchone()
+        storage = self._verified_connector(result.connector, result.cache_scope)
+        baseline_key = f"baseline:{storage}"
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                baseline = connection.execute(
+                    "SELECT value FROM app_meta WHERE key = ?", (baseline_key,)
+                ).fetchone()
 
-            connection.execute(
-                "UPDATE entities SET active = 0 WHERE connector = ? AND entity_kind = 'work_item'",
-                (result.connector,),
-            )
-            previous_items = {
-                row['entity_id']: json.loads(row['payload_json'])
-                for row in connection.execute("SELECT entity_id, payload_json FROM entities WHERE connector = ? AND entity_kind = 'work_item'", (result.connector,))
-            }
-            for item in result.work_items:
-                previous = previous_items.get(item.id, {})
-                historical = set(previous.get('metadata', {}).get('tracked_relationships', [])) | set(previous.get('reasons', [])) | set(item.reasons)
-                item.metadata['tracked_relationships'] = sorted(historical)
-                if 'assigned' in historical and 'assigned' not in item.reasons and 'previously_assigned' not in item.reasons:
-                    item.reasons.append('previously_assigned')
-            current_items = {item.id: item.model_dump(mode='json') for item in result.work_items}
-            for item in result.work_items:
-                self._upsert_entity(connection, result.connector, "work_item", item, item.updated_at, now)
-            for activity in result.activities:
-                if activity.item_id not in previous_items and activity.item_id not in current_items:
-                    parent = WorkItem(id=activity.item_id, source=activity.source, source_type='unknown', project='', key=activity.item_key, title=activity.item_title, url=activity.url, status='Unknown', updated_at=activity.timestamp, reasons=activity.reasons, metadata={'discovered_from_update': True})
-                    self._upsert_entity(connection, result.connector, 'work_item', parent, parent.updated_at, now)
-                    connection.execute('UPDATE entities SET active = 0 WHERE entity_id = ?', (parent.id,))
-                    previous_items[parent.id] = parent.model_dump(mode='json')
-                if activity.event_type == 'updated' and not activity.changes:
-                    existing = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity'", (activity.id,)).fetchone()
-                    saved = json.loads(existing['payload_json']) if existing else {}
-                    if saved.get('changes'):
-                        activity = activity.model_copy(update={key: saved.get(key) for key in ('changes', 'detail_source', 'summary', 'actor')})
-                    elif activity.item_id in previous_items and activity.item_id in current_items:
-                        before, after = previous_items[activity.item_id], current_items[activity.item_id]
-                        if before.get('updated_at') != after.get('updated_at'):
-                            changes = snapshot_changes(before, after)
-                            if changes:
-                                activity = activity.model_copy(update={'changes': changes, 'detail_source': 'Between local refreshes', 'summary': '; '.join(changes)})
-                self._upsert_entity(
-                    connection, result.connector, "activity", activity, activity.timestamp, now
-                )
-
-            if baseline is None:
-                rows = connection.execute(
-                    "SELECT entity_id, version_hash FROM entities WHERE connector = ? AND active = 1",
-                    (result.connector,),
-                ).fetchall()
-                for row in rows:
-                    connection.execute(
-                        """
-                        INSERT INTO local_state(entity_id, seen_version, dismissed_version, updated_at)
-                        VALUES(?, ?, NULL, ?)
-                        ON CONFLICT(entity_id) DO UPDATE SET
-                            seen_version = excluded.seen_version,
-                            updated_at = excluded.updated_at
-                        """,
-                        (row["entity_id"], row["version_hash"], now),
-                    )
                 connection.execute(
-                    "INSERT INTO app_meta(key, value) VALUES(?, ?)", (baseline_key, now)
+                    "UPDATE entities SET active = 0 WHERE connector = ? AND entity_kind = 'work_item'",
+                    (storage,),
                 )
+                previous_items = {
+                    json.loads(row['payload_json'])['id']: json.loads(row['payload_json'])
+                    for row in connection.execute("SELECT entity_id, payload_json FROM entities WHERE connector = ? AND entity_kind = 'work_item'", (storage,))
+                }
+                for item in result.work_items:
+                    previous = previous_items.get(item.id, {})
+                    historical = set(previous.get('metadata', {}).get('tracked_relationships', [])) | set(previous.get('reasons', [])) | set(item.reasons)
+                    item.metadata['tracked_relationships'] = sorted(historical)
+                    if 'assigned' in historical and 'assigned' not in item.reasons and 'previously_assigned' not in item.reasons:
+                        item.reasons.append('previously_assigned')
+                current_items = {item.id: item.model_dump(mode='json') for item in result.work_items}
+                for item in result.work_items:
+                    self._upsert_entity(connection, storage, "work_item", item, item.updated_at, now)
+                for activity in result.activities:
+                    if activity.item_id not in previous_items and activity.item_id not in current_items:
+                        parent = WorkItem(id=activity.item_id, source=activity.source, source_type='unknown', project='', key=activity.item_key, title=activity.item_title, url=activity.url, status='Unknown', updated_at=activity.timestamp, reasons=activity.reasons, metadata={'discovered_from_update': True})
+                        self._upsert_entity(connection, storage, 'work_item', parent, parent.updated_at, now)
+                        connection.execute('UPDATE entities SET active = 0 WHERE entity_id = ?', (self._entity_id(storage, parent.id),))
+                        previous_items[parent.id] = parent.model_dump(mode='json')
+                    if activity.event_type == 'updated' and not activity.changes:
+                        existing = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity'", (self._entity_id(storage, activity.id),)).fetchone()
+                        saved = json.loads(existing['payload_json']) if existing else {}
+                        if saved.get('changes'):
+                            activity = activity.model_copy(update={key: saved.get(key) for key in ('changes', 'detail_source', 'summary', 'actor')})
+                        elif activity.item_id in previous_items and activity.item_id in current_items:
+                            before, after = previous_items[activity.item_id], current_items[activity.item_id]
+                            if before.get('updated_at') != after.get('updated_at'):
+                                changes = snapshot_changes(before, after)
+                                if changes:
+                                    activity = activity.model_copy(update={'changes': changes, 'detail_source': 'Between local refreshes', 'summary': '; '.join(changes)})
+                    self._upsert_entity(
+                        connection, storage, "activity", activity, activity.timestamp, now
+                    )
 
-            cutoff = (utc_now() - timedelta(days=retention_days)).isoformat()
-            connection.execute(
-                "DELETE FROM entities WHERE entity_kind = 'activity' AND event_at < ?", (cutoff,)
-            )
-            connection.execute(
-                "DELETE FROM local_state WHERE entity_id NOT IN (SELECT entity_id FROM entities)"
-            )
-            self._write_health(connection, result.health)
+                if baseline is None:
+                    rows = connection.execute(
+                        "SELECT entity_id, version_hash FROM entities WHERE connector = ? AND active = 1",
+                        (storage,),
+                    ).fetchall()
+                    for row in rows:
+                        connection.execute(
+                            """
+                            INSERT INTO local_state(entity_id, seen_version, dismissed_version, updated_at)
+                            VALUES(?, ?, NULL, ?)
+                            ON CONFLICT(entity_id) DO UPDATE SET
+                                seen_version = excluded.seen_version,
+                                updated_at = excluded.updated_at
+                            """,
+                            (row["entity_id"], row["version_hash"], now),
+                        )
+                    connection.execute(
+                        "INSERT INTO app_meta(key, value) VALUES(?, ?)", (baseline_key, now)
+                    )
+
+                cutoff = (utc_now() - timedelta(days=retention_days)).isoformat()
+                if self._cache_bindings is None:
+                    connection.execute("DELETE FROM entities WHERE entity_kind = 'activity' AND event_at < ?", (cutoff,))
+                    connection.execute("DELETE FROM local_state WHERE entity_id NOT IN (SELECT entity_id FROM entities)")
+                else:
+                    connection.execute("DELETE FROM local_state WHERE entity_id IN (SELECT entity_id FROM entities WHERE connector = ? AND entity_kind = 'activity' AND event_at < ?)", (storage, cutoff))
+                    connection.execute("DELETE FROM entities WHERE connector = ? AND entity_kind = 'activity' AND event_at < ?", (storage, cutoff))
+                self._write_health(connection, result.health, storage)
+
+            if self._cache_bindings is not None:
+                self._active_connectors[result.connector] = storage
 
     def _upsert_entity(
         self,
@@ -193,10 +296,11 @@ class Store:
         now: str,
     ) -> None:
         payload, version = self._payload(model)
+        entity_id = self._entity_id(connector, model.id)
         if kind == 'activity':
             previous = connection.execute(
                 "SELECT payload_json, version_hash FROM entities WHERE entity_id = ?",
-                (model.id,),
+                (entity_id,),
             ).fetchone()
             if previous and self._activity_version(json.loads(previous['payload_json'])) == version:
                 # Reuse legacy full-payload versions until source content changes.
@@ -219,7 +323,7 @@ class Store:
                 active = 1
             """,
             (
-                model.id,
+                entity_id,
                 kind,
                 connector,
                 model.source,
@@ -233,14 +337,17 @@ class Store:
 
     def record_health(self, health: ConnectorHealth) -> None:
         with self._lock, self._connect() as connection:
-            self._write_health(connection, health)
+            storage = self._storage_connector(health.connector)
+            if storage is not None:
+                self._write_health(connection, health, storage)
 
     @staticmethod
-    def _write_health(connection: sqlite3.Connection, health: ConnectorHealth) -> None:
+    def _write_health(connection: sqlite3.Connection, health: ConnectorHealth, connector: str | None = None) -> None:
+        connector = connector or health.connector
         if health.last_success_at is None:
             previous = connection.execute(
                 "SELECT health_json FROM connector_runs WHERE connector = ?",
-                (health.connector,),
+                (connector,),
             ).fetchone()
             if previous is not None:
                 try:
@@ -255,22 +362,24 @@ class Store:
             INSERT INTO connector_runs(connector, health_json) VALUES(?, ?)
             ON CONFLICT(connector) DO UPDATE SET health_json = excluded.health_json
             """,
-            (health.connector, payload),
+            (connector, payload),
         )
 
     def load(self) -> tuple[list[WorkItem], list[Activity], list[ConnectorHealth]]:
         with self._lock, self._connect() as connection:
+            scope, scopes = self._scope_filter('e')
+            health_scope, health_scopes = self._scope_filter()
             rows = connection.execute(
-                """
+                f"""
                 SELECT e.*, s.seen_version, s.dismissed_version
                 FROM entities e
                 LEFT JOIN local_state s ON s.entity_id = e.entity_id
-                WHERE e.active = 1 OR e.entity_kind = 'work_item'
+                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND {scope}
                 ORDER BY e.event_at DESC
-                """
+                """, scopes
             ).fetchall()
             health_rows = connection.execute(
-                "SELECT health_json FROM connector_runs ORDER BY connector"
+                f"SELECT health_json FROM connector_runs WHERE {health_scope} ORDER BY connector", health_scopes
             ).fetchall()
 
         work_items: list[WorkItem] = []
@@ -278,7 +387,7 @@ class Store:
         for row in rows:
             if row["dismissed_version"] == row["version_hash"] or (row['entity_kind'] == 'work_item' and row['dismissed_version'] is not None):
                 continue
-            data = json.loads(row["payload_json"])
+            data = self._row_data(row)
             data["unread"] = row["seen_version"] != row["version_hash"]
             if row["entity_kind"] == "work_item":
                 data['metadata']['snapshot_only'] = not bool(row['active'])
@@ -292,13 +401,14 @@ class Store:
     def load_dismissed(self) -> list[dict]:
         """Durably hidden work, including legacy hashes, and current hidden events."""
         with self._lock, self._connect() as connection:
-            rows = connection.execute("""
-                SELECT e.payload_json, e.entity_kind, e.version_hash, e.active, s.seen_version, s.updated_at
+            scope, scopes = self._scope_filter('e')
+            rows = connection.execute(f"""
+                SELECT e.entity_id, e.connector, e.payload_json, e.entity_kind, e.version_hash, e.active, s.seen_version, s.updated_at
                 FROM entities e JOIN local_state s ON s.entity_id = e.entity_id
-                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND (e.version_hash = s.dismissed_version OR (e.entity_kind = 'work_item' AND s.dismissed_version IS NOT NULL))
+                WHERE (e.active = 1 OR e.entity_kind = 'work_item') AND {scope} AND (e.version_hash = s.dismissed_version OR (e.entity_kind = 'work_item' AND s.dismissed_version IS NOT NULL))
                 ORDER BY s.updated_at DESC
-            """).fetchall()
-        return [{**json.loads(row['payload_json']), 'entity_kind': row['entity_kind'],
+            """, scopes).fetchall()
+        return [{**self._row_data(row), 'entity_kind': row['entity_kind'],
                  'unread': row['seen_version'] != row['version_hash'],
                  'metadata': {**json.loads(row['payload_json']).get('metadata', {}), 'snapshot_only': not bool(row['active'])},
                  'dismissed_at': row['updated_at']} for row in rows]
@@ -307,7 +417,8 @@ class Store:
         """Hide inventory until restored; related updates remain independent."""
         with self._lock, self._connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            if not connection.execute("SELECT 1 FROM entities WHERE entity_id = ? AND entity_kind = 'work_item'", (entity_id,)).fetchone():
+            scope, scopes = self._scope_filter()
+            if not connection.execute(f"SELECT 1 FROM entities WHERE entity_id = ? AND entity_kind = 'work_item' AND {scope}", (entity_id, *scopes)).fetchone():
                 return []
             token = 'work:' + uuid.uuid4().hex
             connection.execute('''INSERT INTO local_state(entity_id, dismissed_version, updated_at)
@@ -320,14 +431,15 @@ class Store:
         """Hide existing update events, never their parent item or future updates."""
         with self._lock, self._connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            target = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity' AND active = 1", (entity_id,)).fetchone()
+            scope, scopes = self._scope_filter()
+            target = connection.execute(f"SELECT payload_json, connector FROM entities WHERE entity_id = ? AND entity_kind = 'activity' AND active = 1 AND {scope}", (entity_id, *scopes)).fetchone()
             if not target:
                 return []
             item_id = json.loads(target['payload_json'])['item_id']
             rows = connection.execute("""SELECT e.entity_id, e.version_hash, e.payload_json
                 FROM entities e LEFT JOIN local_state s ON s.entity_id = e.entity_id
-                WHERE e.entity_kind = 'activity' AND e.active = 1
-                AND (s.dismissed_version IS NULL OR s.dismissed_version != e.version_hash)""").fetchall()
+                WHERE e.entity_kind = 'activity' AND e.active = 1 AND e.connector = ?
+                AND (s.dismissed_version IS NULL OR s.dismissed_version != e.version_hash)""", (target['connector'],)).fetchall()
             undo = []
             for row in rows:
                 if row['entity_id'] != entity_id and not (all_for_item and json.loads(row['payload_json'])['item_id'] == item_id):
@@ -342,10 +454,12 @@ class Store:
     def restore_dismissed(self, entries: list[dict]) -> None:
         """Undo only the versions hidden by that action, preserving seen state."""
         with self._lock, self._connect() as connection:
+            scope, scopes = self._scope_filter()
             for entry in entries:
-                connection.execute("""UPDATE local_state SET dismissed_version = NULL
-                    WHERE entity_id = ? AND dismissed_version = ?""",
-                    (entry['entity_id'], entry['version']))
+                connection.execute(f"""UPDATE local_state SET dismissed_version = NULL
+                    WHERE entity_id = ? AND dismissed_version = ?
+                    AND entity_id IN (SELECT entity_id FROM entities WHERE {scope})""",
+                    (entry['entity_id'], entry['version'], *scopes))
 
     def mark_batch(self, entity_ids: list[str], action: str) -> int:
         """Read an event plus its parent, or selected work plus its current events.
@@ -356,7 +470,8 @@ class Store:
         """
         with self._lock, self._connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            rows = connection.execute('SELECT entity_id, entity_kind, version_hash, payload_json FROM entities').fetchall()
+            scope, scopes = self._scope_filter()
+            rows = connection.execute(f'SELECT entity_id, connector, entity_kind, version_hash, payload_json FROM entities WHERE {scope}', scopes).fetchall()
             by_id = {row['entity_id']: row for row in rows}
             selected = set(entity_ids) & by_id.keys()
             targets = set(selected)
@@ -365,13 +480,13 @@ class Store:
                 for entity_id in selected:
                     row = by_id[entity_id]
                     if row['entity_kind'] == 'activity':
-                        parent_id = json.loads(row['payload_json'])['item_id']
+                        parent_id = self._entity_id(row['connector'], json.loads(row['payload_json'])['item_id'])
                         if action == 'seen_related':
                             selected_work.add(parent_id)
                         if parent_id in by_id and by_id[parent_id]['entity_kind'] == 'work_item':
                             targets.add(parent_id)
                 for row in rows:
-                    if row['entity_kind'] == 'activity' and json.loads(row['payload_json'])['item_id'] in selected_work:
+                    if row['entity_kind'] == 'activity' and self._entity_id(row['connector'], json.loads(row['payload_json'])['item_id']) in selected_work:
                         targets.add(row['entity_id'])
             now = utc_now().isoformat()
             for entity_id in targets:
@@ -385,8 +500,9 @@ class Store:
         if action in {'seen', 'seen_related', 'unread'}:
             return bool(self.mark_batch([entity_id], action))
         with self._lock, self._connect() as connection:
+            scope, scopes = self._scope_filter()
             row = connection.execute(
-                "SELECT version_hash FROM entities WHERE entity_id = ? AND (active = 1 OR entity_kind = 'work_item')", (entity_id,)
+                f"SELECT version_hash FROM entities WHERE entity_id = ? AND (active = 1 OR entity_kind = 'work_item') AND {scope}", (entity_id, *scopes)
             ).fetchone()
             if row is None:
                 return False

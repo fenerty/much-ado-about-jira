@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -18,14 +20,15 @@ from startup import StartupSettings, acquire_instance, listener_identity
 
 settings = load_settings()
 startup = StartupSettings(settings.project_root)
-store = Store(settings.database_path)
+store = Store(settings.database_path, cache_bindings=settings.cache_bindings)
 coordinator = RefreshCoordinator(settings, store)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.initialize()
-    startup.initialize()
+    if '--smoke-test' not in sys.argv:
+        startup.initialize()
     refresh_task = asyncio.create_task(coordinator.run_periodic())
     try:
         yield
@@ -170,14 +173,15 @@ def main():
 
     import uvicorn
 
-    import sys
-    import socket
     background = '--background' in sys.argv
+    smoke_test = '--smoke-test' in sys.argv
+    if smoke_test and (settings.azure_devops.enabled or settings.jira.enabled or not os.environ.get('MUCH_ADO_STATE_DIR')):
+        raise ValueError('--smoke-test requires disabled sources and an explicit MUCH_ADO_STATE_DIR.')
     instance_handle = acquire_instance(settings.app.port)
     listener = listener_identity(settings.app.host, settings.app.port)
     if listener == 'other':
         message = f'Port {settings.app.port} is already used by another application. Close that application or choose another port in settings.toml.'
-        if not background:
+        if not background and not smoke_test:
             import tkinter.messagebox
             tkinter.messagebox.showerror('Dashboard could not start', message)
         else:
@@ -185,13 +189,14 @@ def main():
             logging.error(message)
         sys.exit(1)
     if not instance_handle or listener == 'ours':
-        if not background and listener == 'ours':
+        if not background and not smoke_test and listener == 'ours':
             webbrowser.open(f"http://{settings.app.host}:{settings.app.port}")
         sys.exit(0)
-    if not background:
+    if not background and not smoke_test:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{settings.app.host}:{settings.app.port}")).start()
+    logging_options = {'log_config': None} if background or sys.stdout is None or sys.stderr is None else {}
     uvicorn.run(app, host=settings.app.host, port=settings.app.port,
-                log_level="info", **({'log_config': None} if background else {}))
+                log_level="info", **logging_options)
 
 
 if __name__ == "__main__":

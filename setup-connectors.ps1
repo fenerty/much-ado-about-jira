@@ -14,11 +14,29 @@ $azureCommand = Join-Path $azureRoot 'bin\az.cmd'
 
 New-Item -ItemType Directory -Path $projectToolRoot -Force | Out-Null
 
-if (-not $AzureOnly -and -not (Test-Path -LiteralPath $acliPath)) {
+function Test-AtlassianCli([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        & $Path --version | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+if (-not $AzureOnly -and -not (Test-AtlassianCli $acliPath)) {
     Write-Host 'Downloading the official Atlassian CLI...'
-    Invoke-WebRequest `
-        -Uri 'https://acli.atlassian.com/windows/latest/acli_windows_amd64/acli.exe' `
-        -OutFile $acliPath
+    $acliDownload = Join-Path $projectToolRoot ('acli-download-' + [guid]::NewGuid().ToString('N') + '.exe')
+    try {
+        Invoke-WebRequest `
+            -Uri 'https://acli.atlassian.com/windows/latest/acli_windows_amd64/acli.exe' `
+            -OutFile $acliDownload
+        if (-not (Test-AtlassianCli $acliDownload)) { throw 'The downloaded Atlassian CLI could not start. Retry setup.' }
+        Move-Item -LiteralPath $acliDownload -Destination $acliPath -Force
+    } finally {
+        # Only remove this attempt's temporary file; preserve an existing tool.
+        if (Test-Path -LiteralPath $acliDownload) { Remove-Item -LiteralPath $acliDownload -Force }
+    }
 }
 
 $installedAzure = Get-Command az -ErrorAction SilentlyContinue

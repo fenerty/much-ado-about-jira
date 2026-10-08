@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from config import JiraSettings
+from config import JiraSettings, source_scope
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_jira_read_command, safe_error
 from .base import CommandSpec, ConnectorFailure, async_run_command, display_name, local_cli_bridge, parse_datetime, parse_json_output, unique_strings
@@ -32,6 +32,7 @@ class JiraConnector:
         self._fresh_roles: dict[str, set[str]] = {}
         self._verified_history_roles: dict[str, set[str]] = {}
         self._enrichment_failures: list[str] = []
+        self.state_loader = None
 
     def load_state(self, state: dict) -> None:
         self._saved_state = state
@@ -62,6 +63,9 @@ class JiraConnector:
         try:
             executable = self._find_cli()
             identity = await self._authenticate(executable)
+            verified_cache_scope = source_scope(self.name, identity["site"], identity["email"])
+            if self.state_loader is not None:
+                self.load_state(self.state_loader(verified_cache_scope))
             candidates, query_roles, partial_queries = await self._query_candidates(executable, identity, include_history=False)
             records, hydrate_failures = await self._hydrate_candidates(executable, candidates, include_history=False)
             partial_queries.extend(hydrate_failures)
@@ -84,6 +88,7 @@ class JiraConnector:
                     message = "Jira refreshed; older history discovery and details advance in saved batches"
             return ConnectorResult(
                 connector=self.name,
+                cache_scope=verified_cache_scope,
                 work_items=items,
                 activities=activities,
                 health=ConnectorHealth(
@@ -634,14 +639,17 @@ class JiraConnector:
 
     @staticmethod
     def _is_self(author: dict[str, Any], identity: dict[str, str]) -> bool:
-        account_id = str(author.get("accountId") or "").lower()
-        email = str(author.get("emailAddress") or "").lower()
-        name = str(author.get("displayName") or "").lower()
-        return bool(
-            (identity.get("account_id") and account_id == identity["account_id"].lower())
-            or (identity.get("email") and email == identity["email"].lower())
-            or (identity.get("display_name") and name == identity["display_name"].lower())
-        )
+        account_id = str(author.get("accountId") or "").strip().lower()
+        self_account_id = str(identity.get("account_id") or "").strip().lower()
+        if account_id and self_account_id:
+            return account_id == self_account_id
+        email = str(author.get("emailAddress") or "").strip().lower()
+        self_email = str(identity.get("email") or "").strip().lower()
+        if email and self_email:
+            return email == self_email
+        name = str(author.get("displayName") or "").strip().lower()
+        self_name = str(identity.get("display_name") or "").strip().lower()
+        return bool(name and self_name and name == self_name)
 
     @staticmethod
     def _adf_text_and_mentions(value: Any) -> tuple[str, list[str]]:
@@ -675,13 +683,19 @@ class JiraConnector:
 
     @staticmethod
     def _status_category(status: str, category: str) -> str:
-        combined = f"{status} {category}".lower()
-        if any(word in combined for word in ("done", "closed", "resolved", "complete")):
+        status_name = " ".join(status.lower().split())
+        category_name = " ".join(category.lower().split())
+        source_category = {"done": "done", "in progress": "in_progress", "to do": "todo"}.get(category_name)
+        if source_category == "done":
             return "done"
-        if "block" in combined or "pending" in combined:
+        if re.search(r"\b(?:blocked|pending)\b", status_name):
             return "blocked"
-        if any(word in combined for word in ("progress", "implement", "develop", "review")):
+        if source_category:
+            return source_category
+        if status_name in {"done", "closed", "resolved", "complete", "completed"}:
+            return "done"
+        if status_name in {"in progress", "implementing", "implementation", "developing", "development", "in review", "review"}:
             return "in_progress"
-        if any(word in combined for word in ("to do", "open", "ready", "new", "backlog")):
+        if status_name in {"to do", "open", "ready", "new", "backlog"}:
             return "todo"
         return "other"
