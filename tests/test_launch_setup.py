@@ -122,6 +122,79 @@ catch {{ Write-Output $_.Exception.Message }}
     assert python_path.exists()
 
 
+@pytest.mark.parametrize('source', ['path', 'launcher', 'registry', 'missing'])
+def test_setup_selects_verified_python313_before_creating_environment(tmp_path, source):
+    shutil.copyfile(ROOT / 'setup.ps1', tmp_path / 'setup.ps1')
+    old_python = tmp_path / 'python312.exe'
+    python313 = tmp_path / 'python313.exe'
+    launcher = tmp_path / 'py.exe'
+    for executable in (old_python, python313, launcher):
+        executable.touch()
+    venv_python = tmp_path / '.venv' / 'Scripts' / 'python.exe'
+    script = f"""
+$ErrorActionPreference = 'Stop'
+function Invoke-Python312 {{
+    if ($args -contains 'venv') {{ throw 'Created environment with unsupported Python' }}
+    $global:LASTEXITCODE = 1
+    Write-Output {ps_quote(old_python)}
+}}
+function Invoke-Python313 {{
+    $global:LASTEXITCODE = 0
+    if ($args -contains 'venv') {{
+        New-Item -ItemType Directory -Force -Path {ps_quote(venv_python.parent)} | Out-Null
+        New-Item -ItemType File -Path {ps_quote(venv_python)} | Out-Null
+        Set-Alias -Name {ps_quote(venv_python)} -Value Invoke-Python313 -Scope Global
+        Write-Output 'Created environment with Python 3.13'
+    }} elseif ($args -contains '-c') {{
+        Write-Output {ps_quote(python313)}
+    }}
+}}
+function Invoke-Py {{
+    if ($args[0] -ne '-3.13') {{ throw 'Launcher used its unsupported default Python' }}
+    Invoke-Python313 @args
+}}
+Set-Alias -Name {ps_quote(old_python)} -Value Invoke-Python312
+Set-Alias -Name {ps_quote(python313)} -Value Invoke-Python313
+Set-Alias -Name {ps_quote(launcher)} -Value Invoke-Py
+function Get-Command {{
+    param($Name, $ErrorAction)
+    if ($Name -eq 'python') {{
+        $path = {ps_quote(python313)}
+        if ({ps_quote(source)} -ne 'path') {{ $path = {ps_quote(old_python)} }}
+        return [PSCustomObject]@{{ Source = $path }}
+    }}
+    if ($Name -eq 'py' -and {ps_quote(source)} -eq 'launcher') {{
+        return [PSCustomObject]@{{ Source = {ps_quote(launcher)} }}
+    }}
+}}
+function Test-Path {{
+    param($Path, $LiteralPath)
+    if ($Path -eq 'HKCU:\\Software\\Python\\PythonCore\\3.13\\InstallPath') {{
+        return ({ps_quote(source)} -eq 'registry')
+    }}
+    if ($LiteralPath) {{ return Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath }}
+    return Microsoft.PowerShell.Management\\Test-Path -Path $Path
+}}
+function Get-ItemProperty {{
+    param($Path)
+    return [PSCustomObject]@{{ ExecutablePath = {ps_quote(python313)} }}
+}}
+try {{ & {ps_quote(tmp_path / 'setup.ps1')} }}
+catch {{ Write-Output $_.Exception.Message }}
+"""
+    output = powershell(script)
+    assert 'Created environment with unsupported Python' not in output
+    assert 'Launcher used its unsupported default Python' not in output
+    if source == 'missing':
+        assert 'Python 3.13 was not found' in output
+        assert 'Python environment ready' not in output
+        assert not venv_python.exists()
+    else:
+        assert 'Created environment with Python 3.13' in output
+        assert 'Python environment ready' in output
+        assert venv_python.exists()
+
+
 def installer_stub(tool_root, fail_download=False):
     return f"""
 $ErrorActionPreference = 'Stop'
