@@ -65,6 +65,10 @@ Cached work, history progress, and personal read/hidden state are separated by s
 
 On upgrade, a single original Jira snapshot can be carried forward when its saved history fingerprint proves the same source and account. Older Jira caches may already mix sources or accounts, and legacy ADO cache labels do not prove account identity. Their ownership cannot be assigned safely: they stay in the local database, separate from the new workspace, whose first successful snapshot establishes a fresh baseline. Keep a backup of the database before upgrades if you need to retain older triage state.
 
+If you can confirm that a connector's legacy cache belongs entirely to the currently configured source and account, `scripts/restore-legacy-read-state.py` can preserve update read/unread and hidden state without importing legacy history into the visible workspace. Preview with `python scripts/restore-legacy-read-state.py --config <settings.toml> --database <dashboard.sqlite3> --connector jira --scope <verified-scope>`. Add `--apply --backup <new-backup.sqlite3>` only after confirming ownership. A successful account-scoped refresh and an explicitly configured account are required; the backup must be a new file.
+
+The binding applies to updates already rediscovered and to later historical batches. Only identical event content can inherit a read or hidden acknowledgement; new or changed updates remain unread. Explicit actions in the new workspace take precedence over imported state. The initial automatic baseline is replaced by the confirmed legacy state, and the binding cannot be reused for another source or account. No Jira or ADO data is modified. Update age alone never proves that an update has been read.
+
 Keep local settings, authentication stores, databases, logs, screenshots of real work, and corporate exports out of commits. The repository includes only generic configuration and synthetic test examples. `MUCH_ADO_CONFIG` can point to a separate local TOML configuration.
 
 ## Development

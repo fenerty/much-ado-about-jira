@@ -204,6 +204,99 @@ class Store:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
     @staticmethod
+    def _legacy_read_bound(connection: sqlite3.Connection, storage: str) -> bool:
+        connector = storage.split('@', 1)[0]
+        row = connection.execute(
+            'SELECT value FROM app_meta WHERE key = ?', (f'legacy_read_scope:{connector}',)
+        ).fetchone()
+        return row is not None and row['value'] == storage
+
+    def _legacy_activity_state(self, connection: sqlite3.Connection, storage: str,
+                               raw: dict, version: str) -> tuple[str | None, str | None, str | None] | None:
+        connector = storage.split('@', 1)[0]
+        previous = connection.execute('''
+            SELECT e.payload_json, e.version_hash, s.seen_version,
+                   s.dismissed_version, s.updated_at
+            FROM entities e LEFT JOIN local_state s ON s.entity_id = e.entity_id
+            WHERE e.entity_id = ? AND e.connector = ?
+              AND e.entity_kind = 'activity' AND e.source = ?
+        ''', (raw['id'], connector, raw['source'])).fetchone()
+        if previous is None:
+            return None
+        try:
+            saved = json.loads(previous['payload_json'])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(saved, dict) or self._activity_version(saved) != self._activity_version(raw):
+            return None
+        # Translate only acknowledgements of this exact retained content. A
+        # stale version or an explicit Mark unread must remain unread.
+        return (version if previous['seen_version'] == previous['version_hash'] else None,
+                version if previous['dismissed_version'] == previous['version_hash'] else None,
+                previous['updated_at'])
+
+    def bind_legacy_read_state(self, connector: str, cache_scope: str, *, apply: bool = False) -> dict:
+        """Owner-approved continuity for one verified account's legacy updates.
+
+        Preview by default. This never exposes legacy entities or assigns their
+        history to an account automatically. Newer destination actions win.
+        """
+        storage = self._verified_connector(connector, cache_scope)
+        binding = (self._cache_bindings or {}).get(connector, {})
+        if not binding.get('account') or binding.get('scope') != cache_scope:
+            raise ValueError('A configured, verified account is required to bind legacy read state')
+        counts = {'read': 0, 'unread': 0, 'hidden': 0, 'preserved': 0}
+        with self._lock, self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE' if apply else 'BEGIN')
+            key = f'legacy_read_scope:{connector}'
+            bound = connection.execute('SELECT value FROM app_meta WHERE key = ?', (key,)).fetchone()
+            if bound is not None and bound['value'] != storage:
+                raise ValueError('Legacy read state is already bound to a different account or source')
+            health = connection.execute(
+                'SELECT health_json FROM connector_runs WHERE connector = ?', (storage,)
+            ).fetchone()
+            if health is None or ConnectorHealth.model_validate_json(health['health_json']).last_success_at is None:
+                raise ValueError('A successful verified account refresh is required before binding')
+            if connection.execute(
+                "SELECT 1 FROM entities WHERE connector = ? AND entity_kind = 'activity' LIMIT 1",
+                (connector,),
+            ).fetchone() is None:
+                raise ValueError('No preserved legacy updates exist to bind')
+            baseline = connection.execute(
+                'SELECT value FROM app_meta WHERE key = ?', (f'baseline:{storage}',)
+            ).fetchone()
+            rows = connection.execute('''
+                SELECT e.*, s.seen_version, s.dismissed_version, s.updated_at AS state_updated_at
+                FROM entities e LEFT JOIN local_state s ON s.entity_id = e.entity_id
+                WHERE e.connector = ? AND e.entity_kind = 'activity'
+            ''', (storage,)).fetchall()
+            now = utc_now().isoformat()
+            for row in rows:
+                initial_seen = (baseline is not None
+                                and row['state_updated_at'] == row['first_seen_at'] == baseline['value']
+                                and row['seen_version'] is not None and row['dismissed_version'] is None)
+                if row['state_updated_at'] is not None and not initial_seen:
+                    counts['preserved'] += 1
+                    continue
+                state = self._legacy_activity_state(
+                    connection, storage, json.loads(row['payload_json']), row['version_hash']
+                )
+                seen, hidden, updated = state or (None, None, None)
+                counts['read' if seen is not None else 'unread'] += 1
+                counts['hidden'] += int(hidden is not None)
+                if apply:
+                    connection.execute('''
+                        INSERT INTO local_state(entity_id, seen_version, dismissed_version, updated_at)
+                        VALUES(?, ?, ?, ?) ON CONFLICT(entity_id) DO UPDATE SET
+                        seen_version = excluded.seen_version,
+                        dismissed_version = excluded.dismissed_version, updated_at = excluded.updated_at
+                    ''', (row['entity_id'], seen, hidden, updated or now))
+            if apply:
+                connection.execute('INSERT INTO app_meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING',
+                                   (key, storage))
+        return counts
+
+    @staticmethod
     def _payload(model: WorkItem | Activity) -> tuple[str, str]:
         raw = model.model_dump(mode="json")
         raw["unread"] = False
@@ -262,18 +355,18 @@ class Store:
                     )
 
                 if baseline is None:
+                    legacy_bound = self._legacy_read_bound(connection, storage)
                     rows = connection.execute(
-                        "SELECT entity_id, version_hash FROM entities WHERE connector = ? AND active = 1",
-                        (storage,),
+                        "SELECT entity_id, version_hash FROM entities WHERE connector = ? AND active = 1 "
+                        "AND (? = 0 OR entity_kind != 'activity')",
+                        (storage, int(legacy_bound)),
                     ).fetchall()
                     for row in rows:
                         connection.execute(
                             """
                             INSERT INTO local_state(entity_id, seen_version, dismissed_version, updated_at)
                             VALUES(?, ?, NULL, ?)
-                            ON CONFLICT(entity_id) DO UPDATE SET
-                                seen_version = excluded.seen_version,
-                                updated_at = excluded.updated_at
+                            ON CONFLICT(entity_id) DO NOTHING
                             """,
                             (row["entity_id"], row["version_hash"], now),
                         )
@@ -341,6 +434,18 @@ class Store:
                 now,
             ),
         )
+        if kind == 'activity' and self._legacy_read_bound(connection, connector):
+            existing_state = connection.execute(
+                'SELECT 1 FROM local_state WHERE entity_id = ?', (entity_id,)
+            ).fetchone()
+            if existing_state is None:
+                state = self._legacy_activity_state(connection, connector, json.loads(payload), version)
+                if state is not None:
+                    seen, hidden, updated = state
+                    connection.execute('''
+                        INSERT INTO local_state(entity_id, seen_version, dismissed_version, updated_at)
+                        VALUES(?, ?, ?, ?)
+                    ''', (entity_id, seen, hidden, updated or now))
 
     def record_health(self, health: ConnectorHealth, *, cache_scope: str | None = None) -> None:
         if cache_scope is not None:
