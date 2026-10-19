@@ -71,11 +71,19 @@ class AzureDevOpsSettings:
     mention_reply_days: int = 30
     max_work_items: int = 1000
     max_comment_candidates: int = 250
+    refresh_timeout_seconds: int | float = 60
+    history_timeout_seconds: int | float = 10
+    history_batch_size: int = 50
+    history_page_size: int = 100
 
     def __post_init__(self):
         _validate_integer('azure_devops', 'max_work_items', self.max_work_items)
         for name in ('mention_reply_days', 'max_comment_candidates'):
             _validate_integer('azure_devops', name, getattr(self, name), minimum=0)
+        for name in ('refresh_timeout_seconds', 'history_timeout_seconds'):
+            _validate_seconds('azure_devops', name, getattr(self, name))
+        for name in ('history_batch_size', 'history_page_size'):
+            _validate_integer('azure_devops', name, getattr(self, name))
 
 
 @dataclass(frozen=True)

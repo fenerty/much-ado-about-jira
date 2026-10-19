@@ -42,6 +42,68 @@ test('history progress distinguishes saved discovered-ticket checks from unknown
   assert.match(ui.element('#historyProgress').textContent, /saved across restarts/);
 });
 
+test('ADO progress is visible alongside Jira without hiding failures as routine loading', () => {
+  const ui = setup();
+  ui.run(`state.dashboard.health={azure_devops:{connector:'azure_devops',state:'partial',message:'Details are loading',coverage:{history_progress:{total:80,checked:22,remaining:58,failed:0,pending:58,metadata_status:'captured'}}},jira:{connector:'jira',state:'partial',message:'History is advancing',coverage:{completed_history:{total:50,checked:16,remaining:34,batches_remaining:3,failed:0,eta_seconds:540},unavailable_queries:['closed_history:rotating_batch']}}}; render();`);
+  assert.equal(ui.element('#historyProgress').hidden, false);
+  assert.match(ui.element('#historyProgress').textContent, /ADO change details: 22 of 80 tracked items checked · 58 remaining/);
+  assert.match(ui.element('#historyProgress').textContent, /58 items waiting for details/);
+  assert.match(ui.element('#historyProgress').textContent, /Jira older history/);
+  assert.match(ui.element('#health').innerHTML, /ADO · Synced · change details updating/);
+  assert.equal(ui.element('#notice').hidden, true);
+  ui.run(`state.dashboard.health.azure_devops.coverage.history_progress.failed=1;state.dashboard.health.azure_devops.message='One history check failed';render()`);
+  assert.match(ui.element('#health').innerHTML, /ADO · Partial coverage/);
+  assert.match(ui.element('#historyProgress').textContent, /1 check failed and will be retried/);
+  assert.equal(ui.element('#notice').hidden, false);
+  assert.match(ui.element('#notice').textContent, /One history check failed/);
+  ui.run(`state.dashboard.health.azure_devops.coverage.history_progress.failed=0;state.dashboard.health.azure_devops.coverage.history_progress.metadata_status='failed';render()`);
+  assert.match(ui.element('#health').innerHTML, /ADO · Partial coverage/);
+  assert.equal(ui.element('#notice').hidden, false);
+});
+
+test('other ADO partial coverage never appears as a routine change-details backlog', () => {
+  const ui = setup();
+  for (const coverage of [
+    {work_query_incomplete:true}, {pull_request_query_incomplete:true},
+    {unavailable_queries:['work_items:cap']},
+    {history_progress:{total:10,remaining:8,inventory_failed:true}},
+    {history_progress:{total:10,remaining:8,unavailable:1}},
+  ]) {
+    ui.run(`renderHealth({azure_devops:{connector:'azure_devops',state:'partial',message:'Incomplete coverage',coverage:{history_progress:{total:10,remaining:8},...${JSON.stringify(coverage)}}}})`);
+    assert.match(ui.element('#health').innerHTML, /ADO · Partial coverage/);
+    assert.doesNotMatch(ui.element('#health').innerHTML, /Synced · change details updating/);
+    assert.equal(ui.element('#notice').hidden, false);
+  }
+});
+
+test('update detail states distinguish pending retry administrative captured and unavailable', () => {
+  const ui = setup();
+  const expected = {
+    pending: 'Update detected · change details pending',
+    failed: 'Change details could not be loaded · will retry',
+    administrative: 'Administrative update',
+    captured: 'Update captured · no field changes',
+    unavailable: 'Update detected · field details unavailable',
+  };
+  for (const [detail_status, description] of Object.entries(expected)) {
+    seed(ui,[event('update','ado:1','2026-09-15',{source:'ado',event_type:'updated',detail_status,actor:'Example Engineer',detail_source:'ADO change history'})]);
+    assert.ok(ui.element('#workList').innerHTML.includes(description));
+    assert.match(ui.element('#workList').innerHTML, /ADO change history · Example Engineer/);
+    if (detail_status !== 'unavailable') assert.doesNotMatch(ui.element('#workList').innerHTML, /field details unavailable/);
+  }
+  seed(ui,[event('legacy','ado:1','2026-09-15',{source:'ado',event_type:'updated'})]);
+  assert.match(ui.element('#workList').innerHTML, /Update detected · field details unavailable/);
+});
+
+test('captured changes and history actor are escaped and do not show a missing-details warning', () => {
+  const ui = setup();
+  seed(ui,[event('update','ado:1','2026-09-15',{source:'ado',event_type:'updated',detail_status:'captured',actor:'<script>actor</script>',detail_source:'<b>history</b>',changes:['Target <Date>: None → <img src=x>']})]);
+  const html = ui.element('#workList').innerHTML;
+  assert.match(html, /Target &lt;Date&gt;: None → &lt;img src=x&gt;/);
+  assert.match(html, /&lt;b&gt;history&lt;\/b&gt; · &lt;script&gt;actor&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>|<img|details unavailable|no field changes/);
+});
+
 test('default retains all updates; latest uses parent identity, newest timestamp and stable ID tie break', () => {
   const ui = setup();
   const events = [event('older','jira:A','2026-09-01'),event('z','jira:A','2026-09-15'),event('a','jira:A','2026-09-15'),event('ado','ado:A','2026-09-14',{source:'ado'}),event('missing','jira:B',null)];

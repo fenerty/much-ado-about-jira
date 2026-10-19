@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -13,11 +14,12 @@ from urllib.parse import quote
 
 import httpx
 
-from activity_details import ado_changes
+from activity_details import ado_actor, ado_changes
 from config import AzureDevOpsSettings, source_scope
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_ado_read_operation, safe_error
-from .base import completed_within, CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
+from .base import CommandSpec, ConnectorFailure, display_name, local_cli_bridge, parse_datetime, parse_json_output, run_command, unique_strings
+from .ado_history import AdoHistory
 
 
 ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
@@ -27,16 +29,36 @@ API_VERSION = "7.1"
 class AzureDevOpsConnector:
     name = "azure_devops"
 
-    def __init__(self, settings: AzureDevOpsSettings, timeout_seconds: int):
+    def __init__(self, settings: AzureDevOpsSettings, timeout_seconds: int, retention_days: int = 60):
         self.settings = settings
         self.timeout_seconds = timeout_seconds
-        self._history_cache = {}
-        self._history_cache_scope: str | None = None
+        self.retention_days = retention_days
+        self._saved_state: dict = {}
+        self.state_loader: Callable[[str], dict] | None = None
+        self.history_inventory_loader: Callable[[str], list[dict]] | None = None
+        self._history_coverage: dict = {}
         self.scope_verified: Callable[[str], None] | None = None
         self.verified_cache_scope: str | None = None
 
+    def load_state(self, state: dict | None) -> None:
+        self._saved_state = state or {}
+        if hasattr(self, "_history"):
+            del self._history
+
+    def checkpoint(self) -> dict:
+        return self._history.checkpoint() if hasattr(self, "_history") else {}
+
+    def _ensure_history(self) -> AdoHistory:
+        scope = self.verified_cache_scope or source_scope(
+            self.name, self.settings.organization, self.settings.expected_account
+        )
+        if not hasattr(self, "_history") or self._history.scope != scope:
+            self._history = AdoHistory(scope, self._saved_state)
+        return self._history
+
     async def refresh(self) -> ConnectorResult:
         self.verified_cache_scope = None
+        self._history_coverage = {}
         attempted = utc_now()
         if not self.settings.enabled:
             return self._result("disabled", "Azure DevOps connector is disabled", attempted)
@@ -44,11 +66,12 @@ class AzureDevOpsConnector:
             executable = self._find_cli()
             account = await asyncio.to_thread(self._authenticate, executable)
             self.verified_cache_scope = source_scope(self.name, self.settings.organization, account)
-            if self._history_cache_scope != self.verified_cache_scope:
-                self._history_cache.clear()
-                self._history_cache_scope = self.verified_cache_scope
             if self.scope_verified is not None:
                 self.scope_verified(self.verified_cache_scope)
+            # Always reload committed state. If a previous snapshot was rejected
+            # or cancelled, its in-memory progress must be replayed safely.
+            if self.state_loader is not None:
+                self.load_state(self.state_loader(self.verified_cache_scope))
             token = await asyncio.to_thread(self._access_token, executable)
             async with httpx.AsyncClient(
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -67,14 +90,24 @@ class AzureDevOpsConnector:
                 activities.extend(pr_activity)
 
             message = "Azure DevOps refreshed successfully"
-            state = "partial" if pr_partial or self._work_partial else "ok"
+            history_partial = bool(self._history_coverage.get("incomplete"))
+            state = "partial" if pr_partial or self._work_partial or history_partial else "ok"
             if pr_partial or self._work_partial:
                 message = "Azure DevOps refreshed with incomplete work-item or PR coverage"
+            elif history_partial:
+                if (self._history_coverage.get('failed') or self._history_coverage.get('inventory_failed')
+                        or self._history_coverage.get('metadata_status') == 'failed'):
+                    message = "Azure DevOps work refreshed; some change details could not be read and will retry"
+                elif self._history_coverage.get('unavailable'):
+                    message = "Azure DevOps work refreshed; some update timestamps are unavailable"
+                else:
+                    message = "Azure DevOps work refreshed; change details continue in saved batches"
             return ConnectorResult(
                 connector=self.name,
                 cache_scope=self.verified_cache_scope,
                 work_items=work_items,
                 activities=activities,
+                checkpoint=self.checkpoint(),
                 health=ConnectorHealth(
                     connector=self.name,
                     state=state,
@@ -90,6 +123,8 @@ class AzureDevOpsConnector:
                         "pull_request_query_scope": "organization",
                         "historical_coverage": "Partial: prior assignment queried; comments limited to discovered items; subscriptions not collected",
                         "work_query_incomplete": self._work_partial,
+                        "pull_request_query_incomplete": pr_partial,
+                        "history_progress": self._history_coverage,
                     },
                 ),
             )
@@ -402,6 +437,8 @@ class AzureDevOpsConnector:
                     item_title=title,
                     timestamp=updated,
                     summary=f"{item_type} updated",
+                    detail_status="pending",
+                    source_revision=record.get("rev"),
                     url=item.url,
                     reasons=list(item.reasons),
                 )
@@ -410,37 +447,19 @@ class AzureDevOpsConnector:
             if updated >= cutoff and int(fields.get("System.CommentCount") or 0) > 0:
                 candidates.append((item, record))
 
-        # Bounded, best-effort field history for the latest recent work-item revision.
-        by_id = {str(record.get('id')): record for record in records}
-        history_targets = [item for item in items if item.updated_at >= utc_now() - timedelta(days=self.settings.mention_reply_days)][:50]
-        history_semaphore = asyncio.Semaphore(6)
-        async def history(item):
-            async with history_semaphore:
-                revision = int(by_id.get(item.key, {}).get('rev') or 0)
-                if not revision:
-                    return None
-                cache_key = (item.id, revision)
-                if cache_key in self._history_cache:
-                    return self._history_cache[cache_key]
-                data, _ = await self._json(client, 'GET', f"{self.base_url}/_apis/wit/workItems/{item.key}/updates?$top=2&$skip={max(0, revision - 2)}&api-version={API_VERSION}")
-                update = next((value for value in data.get('value', []) if value.get('rev') == revision), None)
-                if not update:
-                    return None
-                changes = ado_changes(update)
-                result = (item.id, changes, display_name(update.get('revisedBy')))
-                if len(self._history_cache) >= 500:
-                    self._history_cache.clear()
-                self._history_cache[cache_key] = result
-                return result
-        history_results = await completed_within((history(item) for item in history_targets), timeout=5)
-        for result in history_results:
-            if isinstance(result, tuple) and result[1]:
-                for activity in activities:
-                    if activity.item_id == result[0] and activity.event_type == 'updated':
-                        activity.changes = result[1]
-                        activity.summary = '; '.join(result[1])
-                        activity.detail_source = 'ADO revision history'
-                        activity.actor = result[2]
+        activities.extend(await self._capture_history(client, items))
+        # The placeholder has its own explicit outcome until an authoritative
+        # event timestamp lets Store link it to a canonical update ID.
+        history = self._ensure_history()
+        for activity in activities:
+            if activity.source_update_id is not None or activity.event_type != "updated":
+                continue
+            progress = history.records.get(activity.item_key, {})
+            status = progress.get("status", "pending")
+            if status == "failed":
+                activity.detail_status = "failed"
+            elif status in {"captured", "unavailable"} and progress.get("latest_changed_date") != activity.timestamp.isoformat():
+                activity.detail_status = "unavailable"
         candidates = candidates[: self.settings.max_comment_candidates]
         semaphore = asyncio.Semaphore(6)
 
@@ -460,6 +479,220 @@ class AzureDevOpsConnector:
                     target.actionable = target.actionable or bool({"mentioned", "replied"} & set(reasons))
                 activities.extend(new_activity)
         return items, activities, projects
+
+    async def _history_json(self, client: httpx.AsyncClient, url: str, deadline: float) -> dict:
+        """Retry transient history reads within the shared, bounded budget."""
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("ADO history budget exhausted")
+            try:
+                data, _ = await asyncio.wait_for(
+                    self._json(client, "GET", url), min(float(self.timeout_seconds), 2.0, remaining)
+                )
+                return data
+            except (httpx.HTTPError, TimeoutError) as exc:
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                retryable = status is None or status == 429 or status >= 500
+                if not retryable or attempt:
+                    raise
+                delay = 0.1
+                if isinstance(exc, httpx.HTTPStatusError):
+                    try:
+                        delay = max(delay, float(exc.response.headers.get("Retry-After", "0")))
+                    except ValueError:
+                        pass
+                if deadline - time.monotonic() <= delay:
+                    raise
+                await asyncio.sleep(delay)
+        raise RuntimeError("Unreachable history retry")
+
+    async def _history_metadata(self, client: httpx.AsyncClient, deadline: float) -> str:
+        history = self._ensure_history()
+        updated = parse_datetime(history.metadata_at)
+        if history.field_metadata and updated and updated >= utc_now() - timedelta(days=1):
+            return "cached"
+        try:
+            data = await self._history_json(
+                client, f"{self.base_url}/_apis/wit/fields?api-version={API_VERSION}", deadline
+            )
+            values = data.get("value")
+            if not isinstance(values, list):
+                raise ValueError("ADO fields metadata was not a list")
+            metadata = {}
+            for field in values:
+                if not isinstance(field, dict) or not isinstance(field.get("referenceName"), str):
+                    continue
+                metadata[field["referenceName"]] = {
+                    "name": field.get("name"),
+                    "type": "identity" if field.get("isIdentity") else field.get("type"),
+                }
+            sanitized = AdoHistory.sanitize_metadata(metadata)
+            if sanitized != history.field_metadata:
+                # Revisit stable update IDs after a catalogue recovery/change so
+                # earlier fallback formatting can be enriched in place.
+                for record in history.records.values():
+                    record.update(offset=0, seen={}, status="pending", undated=[], latest_changed_date="")
+            history.field_metadata = sanitized
+            history.metadata_at = utc_now().isoformat()
+            return "captured"
+        except (httpx.HTTPError, ConnectorFailure, TimeoutError, ValueError):
+            # Parsing can safely derive field labels and body-only markers even
+            # if the organization denies its field catalogue.
+            return "failed"
+
+    @staticmethod
+    def _history_target(value: WorkItem | dict) -> dict | None:
+        data = value.model_dump() if isinstance(value, WorkItem) else value
+        if not isinstance(data, dict):
+            return None
+        key = str(data.get("key") or str(data.get("id") or "").rsplit(":", 1)[-1])
+        if not key.isdigit() or data.get("source", "ado") != "ado":
+            return None
+        updated = parse_datetime(data.get("updated_at"))
+        if not updated:
+            return None
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        latest_activity = parse_datetime(metadata.get("latest_activity_at"))
+        if latest_activity and latest_activity.tzinfo is None:
+            latest_activity = latest_activity.replace(tzinfo=timezone.utc)
+        return {
+            "id": f"ado:workitem:{key}", "key": key,
+            "title": str(data.get("title") or f"Work item {key}"),
+            "url": str(data.get("url") or ""), "updated_at": updated,
+            "history_at": max(updated, latest_activity) if latest_activity else updated,
+            "snapshot_only": bool(metadata.get("snapshot_only")),
+            "reasons": data.get("reasons") if isinstance(data.get("reasons"), list) else [],
+        }
+
+    async def _capture_history(
+        self, client: httpx.AsyncClient, items: list[WorkItem | dict], *, include_inventory: bool = True
+    ) -> list[Activity]:
+        """Capture a fair page of each selected item, including retained items.
+
+        This can also be called with a cached minimal inventory for a targeted
+        backfill. Its checkpoint must be accepted atomically with its events.
+        """
+        history = self._ensure_history()
+        history.set_retention_days(self.retention_days)
+        cutoff = utc_now() - timedelta(days=self.retention_days)
+        candidates = list(items)
+        inventory_failed = False
+        if include_inventory and self.history_inventory_loader is not None and self.verified_cache_scope:
+            try:
+                candidates = list(self.history_inventory_loader(self.verified_cache_scope)) + candidates
+            except (ValueError, OSError, TypeError):
+                inventory_failed = True
+        targets = {}
+        for value in candidates:
+            target = self._history_target(value)
+            if target and (not target["snapshot_only"] or target["history_at"] >= cutoff):
+                targets[target["key"]] = target
+        # An inventory outage must not discard cursors for retained items.
+        history.prepare(set(targets) | (set(history.records) if inventory_failed else set()), cutoff)
+        for key, target in targets.items():
+            history.observe(key, target["updated_at"])
+        deadline = time.monotonic() + self.settings.history_timeout_seconds
+        metadata_status = await self._history_metadata(client, deadline) if targets else "not_needed"
+        events: list[Activity] = []
+        pages = attempted = 0
+        page_size = self.settings.history_page_size
+        for key in history.batch(self.settings.history_batch_size):
+            if time.monotonic() >= deadline:
+                break
+            target = targets.get(key)
+            if target is None:
+                continue
+            offset = history.start(key)
+            attempted += 1
+            try:
+                data = await self._history_json(
+                    client, f"{self.base_url}/_apis/wit/workItems/{key}/updates?"
+                    f"$top={page_size}&$skip={offset}&api-version={API_VERSION}", deadline
+                )
+                rows = data.get("value")
+                if not isinstance(rows, list):
+                    raise ValueError("ADO update page was not a list")
+                page_events: dict[int, Activity] = {}
+                seen: dict[str, str] = {}
+                undated: set[int] = set()
+                resolved: set[int] = set()
+                latest_changed_date = ""
+                for update in rows:
+                    if not isinstance(update, dict):
+                        raise ValueError("ADO update row was not an object")
+                    identifier = update.get("id")
+                    if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier < 1:
+                        raise ValueError("ADO update row lacks a stable update ID")
+                    fields = update.get("fields") or {}
+                    if not isinstance(fields, dict):
+                        raise ValueError("ADO update fields were not an object")
+                    delta = fields.get("System.ChangedDate") or {}
+                    changed_at = parse_datetime(delta.get("newValue")) if isinstance(delta, dict) else None
+                    revised_at = parse_datetime(update.get("revisedDate"))
+                    now = utc_now()
+                    # ADO uses 9999-01-01 as a sentinel revisedDate. It cannot
+                    # establish a historical event time or a placeholder alias.
+                    if changed_at and (changed_at.tzinfo is None or changed_at > now + timedelta(days=1)):
+                        changed_at = None
+                    if revised_at and (revised_at.tzinfo is None or revised_at > now + timedelta(days=1)):
+                        revised_at = None
+                    changes = ado_changes(update, history.field_metadata)
+                    # revisedDate on field revisions may be the boundary of the
+                    # next revision. Only relation-only updates without fields
+                    # can use it as a fallback time.
+                    if not changed_at and fields:
+                        revised_at = None
+                    timestamp = changed_at or revised_at
+                    if changed_at:
+                        latest_changed_date = max(latest_changed_date, changed_at.isoformat())
+                    if timestamp:
+                        resolved.add(identifier)
+                    if timestamp and timestamp < cutoff:
+                        continue
+                    if timestamp is None:
+                        undated.add(identifier)
+                        continue
+                    seen[str(identifier)] = timestamp.isoformat()
+                    if str(identifier) in history.records[key]["seen"] or identifier in page_events:
+                        continue
+                    detail_status = "captured" if changes else "administrative"
+                    revision = update.get("rev")
+                    page_events[identifier] = Activity(
+                        id=f"ado:workitem:{key}:update:{identifier}", source="ado", event_type="updated",
+                        item_id=target["id"], item_key=key, item_title=target["title"], timestamp=timestamp,
+                        actor=ado_actor(update.get("revisedBy")),
+                        summary="; ".join(changes) if changes else "Administrative update; no user-facing field changes",
+                        changes=changes, detail_source="ADO update history", detail_status=detail_status,
+                        source_update_id=identifier,
+                        source_revision=revision if isinstance(revision, int) and not isinstance(revision, bool) else None,
+                        legacy_activity_id=f"ado:workitem:{key}:updated:{changed_at.isoformat()}" if changed_at else None,
+                        url=target["url"], reasons=target["reasons"],
+                    )
+                # No page progress is accepted before every row is valid and
+                # every event is normalized. Store commits this state+events.
+                history.accept(key, offset, len(rows), page_size, seen, latest_changed_date, undated, resolved)
+                events.extend(page_events.values())
+                pages += 1
+            except (httpx.HTTPError, ConnectorFailure, TimeoutError, ValueError, TypeError) as exc:
+                code = exc.code if isinstance(exc, ConnectorFailure) else (
+                    f"HTTP_{exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+                )
+                history.fail(key, code)
+        counts = {status: sum(record["status"] == status for record in history.records.values())
+                  for status in ("captured", "pending", "failed", "unavailable")}
+        remaining = counts["pending"] + counts["failed"]
+        self._history_coverage = {
+            "total": len(history.records), "checked": counts["captured"] + counts["unavailable"],
+            "remaining": remaining, **counts, "pages": pages, "attempted": attempted, "events": len(events),
+            "retention_days": self.retention_days, "metadata_status": metadata_status,
+            "inventory_failed": inventory_failed,
+            "unavailable_timestamps": sum(len(record["undated"]) for record in history.records.values()),
+            "incomplete": bool(remaining or counts["unavailable"] or metadata_status == "failed" or inventory_failed),
+        }
+        return events
 
     async def _work_item_comments(
         self, client: httpx.AsyncClient, item: WorkItem, self_id: str

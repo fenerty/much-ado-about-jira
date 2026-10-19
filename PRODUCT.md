@@ -21,8 +21,8 @@ Current and previous assignments, authored work, followed/watched items, and wor
 - Prior assignment is queried for both issue sources; completed issues are included, but query limits can truncate historical discovery.
 - Jira comment discovery is limited to configured projects and lookback windows. It is not an all-time participation index.
 - ADO comment discovery starts from retrieved work. Followed subscriptions and arbitrary historic PR participation are not collected.
-- Previously discovered work is retained across query omissions with last-known status explicitly labeled. Historical relationship reasons persist. Direct polling of omitted items and complete historical backfill remain gaps; retention alone does not guarantee fresh status or future updates for omitted items.
-- ADO field details cover a bounded latest revision; Jira uses local snapshot differences. Neither constitutes a complete cross-system audit trail.
+- Previously discovered work is retained across query omissions with last-known status explicitly labeled. Historical relationship reasons persist. ADO polls history for omitted items with retained updates, but refreshing their current work status and complete source discovery remain gaps; retention alone does not guarantee fresh status or future updates for every omitted item.
+- ADO field details use bounded, resumable update pages over discovered current and retained work, with account-scoped progress and visible pending/failure coverage. Enriching a retained update preserves read and hidden state; newly discovered source updates remain separate events. Jira uses local snapshot differences. Neither constitutes a complete cross-system audit trail.
 - PR recency currently reflects the most recent fetched discussion activity or creation time; code pushes and all metadata changes are not fully represented.
 
 The next coverage milestone is a durable relationship registry plus bounded backfill and incremental polling. It must preserve known involvement, distinguish closed work from deleted/unavailable work, and report what is and is not collected. Do not claim full historical coverage before validating it.

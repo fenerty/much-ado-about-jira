@@ -334,7 +334,7 @@ def test_coordinator_uses_independent_jira_deadline_and_saves_checkpoint_after_s
     monkeypatch.setattr(jira, "checkpoint", lambda: {"scope": "new", "version": 1, "cursor": 2})
     monkeypatch.setattr(coordinator.connectors[0], "refresh", ado_refresh)
     asyncio.run(coordinator.refresh())
-    assert sorted(deadlines) == [6, 104]
+    assert sorted(deadlines) == [65, 104]
     assert events.index(("snapshot", "jira")) < events.index(("checkpoint", "jira"))
     assert Store(store.database_path).load_connector_state("jira")["cursor"] == 2
 
