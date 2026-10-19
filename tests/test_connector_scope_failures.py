@@ -177,18 +177,22 @@ def test_unhandled_postauth_failure_leaves_verified_scope_for_coordinator(connec
 
 
 @pytest.mark.parametrize("same_account", [False, True])
-def test_ado_history_memoization_is_reused_only_for_the_same_verified_account(monkeypatch, same_account):
+def test_ado_history_progress_is_reused_only_for_the_same_verified_account(monkeypatch, same_account):
     connector = AzureDevOpsConnector(AzureDevOpsSettings(organization="synthetic-org"), 30)
     monkeypatch.setattr(connector, "_find_cli", lambda: "unused")
     configure_account(connector, monkeypatch, "other@example.test")
     previous_account = "other@example.test" if same_account else "me@example.test"
-    connector._history_cache_scope = source_scope("azure_devops", "synthetic-org", previous_account)
-    cached = {("ado:workitem:1", 3): ("ado:workitem:1", ["Synthetic cached change"], "Author")}
-    connector._history_cache = dict(cached)
+    connector.load_state({
+        'version': 1, 'scope': source_scope('azure_devops', 'synthetic-org', previous_account),
+        'records': {'1': {'offset': 3, 'status': 'captured'}},
+    })
 
     async def read(client):
-        assert connector._history_cache_scope == expected_scope(connector)
-        assert connector._history_cache == (cached if same_account else {})
+        history = connector._ensure_history()
+        assert history.scope == expected_scope(connector)
+        assert set(history.records) == ({'1'} if same_account else set())
+        if same_account:
+            assert history.records['1']['offset'] == 3
         raise OSError("Synthetic later failure")
 
     monkeypatch.setattr(connector, "_connection_identity", read)

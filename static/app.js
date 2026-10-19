@@ -148,12 +148,11 @@ function rowTemplate(item) {
   }
   const isEvent = item.entity_kind === "activity";
   const changes = item.changes || [];
-  const genericUpdate = isEvent && item.event_type === "updated" && !changes.length;
   const relatedUnread = isEvent ? state.unreadByItem.get(item.item_id) || 0 : 0;
   const readRelated = isEvent && relatedUnread > (item.unread ? 1 : 0) ? `<button class="row-action-button" data-action="seen_related" title="Mark all current updates for ${escapeHtml(key)} read, including filtered and hidden updates. New updates stay unread.">Read all for item</button>` : '';
-  const description = isEvent ? (changes.length ? "" : genericUpdate ? "Update detected · field details unavailable" : item.summary) : "";
+  const description = isEvent && !changes.length ? updateDescription(item) : "";
   const rowActions = state.view === "dismissed" ? `<button class="row-action-button" data-action="restore">Restore</button>` : !isEvent ? `<button class="row-action-button" data-action="hide_work" title="Hide from My work until restored. Updates remain available.">Hide</button>` : `${item.unread ? `<button class="row-action-button" data-action="seen">Mark read</button>` : `<button class="row-action-button" data-action="unread">Mark unread</button>`}${readRelated}${isEvent ? '<button class="row-action-button" data-action="dismiss" title="Move this update to Hidden without marking it read.">Hide…</button>' : ""}`;
-  const eventDetails = isEvent && changes.length ? `<div class="event-details"><span class="detail-source">${escapeHtml(item.detail_source || "Change details")}${item.actor ? ` · ${escapeHtml(item.actor)}` : ""}</span><ul>${changes.map(change => `<li>${escapeHtml(change)}</li>`).join("")}</ul></div>` : "";
+  const eventDetails = isEvent && (changes.length || item.detail_source || item.actor) ? `<div class="event-details"><span class="detail-source">${escapeHtml(item.detail_source || "Change details")}${item.actor ? ` · ${escapeHtml(item.actor)}` : ""}</span>${changes.length ? `<ul>${changes.map(change => `<li>${escapeHtml(change)}</li>`).join("")}</ul>` : ""}</div>` : "";
   return `<article class="work-row ${isEvent && item.unread ? "unread" : ""}" data-id="${escapeHtml(item.id)}" data-key="${escapeHtml(key)}">
     <label class="row-select"><input type="checkbox" data-select="${escapeHtml(item.id)}" aria-label="Select ${escapeHtml(key)}" ${state.selected.has(item.id) ? "checked" : ""} ${state.view !== "updates" ? "hidden" : ""}><span class="read-label">${state.view !== "updates" ? "" : item.unread ? "Unread" : "Read"}</span></label>
     <a class="row-main" href="${escapeHtml(safeUrl(item.url))}" target="_blank" rel="noopener noreferrer">
@@ -162,15 +161,27 @@ function rowTemplate(item) {
       ${eventDetails}
     </a><div class="row-side"><span class="age" title="${escapeHtml(timestamp ? new Date(timestamp).toLocaleString() : "Not available")}">${escapeHtml(relativeTime(timestamp))}</span><div class="row-actions">${rowActions}</div></div></article>`;
 }
+function updateDescription(item) {
+  const descriptions = {
+    pending: "Update detected · change details pending",
+    failed: "Change details could not be loaded · will retry",
+    administrative: "Administrative update",
+    captured: "Update captured · no field changes",
+    unavailable: "Update detected · field details unavailable",
+  };
+  return descriptions[item.detail_status] || (item.event_type === "updated" ? descriptions.unavailable : item.summary);
+}
 function routineHistory(item) {
   const queries = item.coverage?.unavailable_queries || [];
+  const adoHistory = item.coverage?.history_progress;
+  if (item.connector === 'azure_devops') return item.state === 'partial' && adoHistory && adoHistory.remaining > 0 && !adoHistory.failed && !adoHistory.unavailable && !adoHistory.inventory_failed && adoHistory.metadata_status !== 'failed' && !item.coverage?.work_query_incomplete && !item.coverage?.pull_request_query_incomplete && !queries.length;
   return item.state === 'partial' && item.coverage?.completed_history && queries.length > 0 && queries.every(query => query === 'closed_history:rotating_batch');
 }
 function renderHealth(health) {
   const values = Object.values(health || {});
   const labels = {ok:"Synced",partial:"Partial coverage",error:"Sync failed",auth_required:"Sign-in needed",disabled:"Disabled",loading:"Loading"};
-  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${routineHistory(item) ? "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
-  const impaired = values.filter(item => ["error","auth_required"].includes(item.state) || item.state === "partial" && (item.coverage?.unavailable_queries || []).some(query => query !== "closed_history:rotating_batch"));
+  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${routineHistory(item) ? item.connector === 'azure_devops' ? "Synced · change details updating" : "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
+  const impaired = values.filter(item => ["error","auth_required"].includes(item.state) || item.state === "partial" && !routineHistory(item));
   $("#notice").hidden = !impaired.length;
   $("#notice").textContent = impaired.map(item => `${item.connector === "azure_devops" ? "ADO" : "Jira"}: ${item.message}`).join(" · ");
   $("#lastRefresh").textContent = values.map(item => `${item.connector === "azure_devops" ? "ADO" : "Jira"}: ${item.message}${item.last_success_at ? ` Last successful sync ${relativeTime(item.last_success_at)}.` : ""}`).join(" ");
@@ -198,11 +209,15 @@ function render() {
   const retention = data.activity_retention_days || 60;
   $("#coverageSummary").textContent = state.view === 'work' ? 'Tracked items · No age cutoff' : state.view === 'updates' ? `${data.activity.length} updates · ${new Set(data.activity.map(item => item.item_id)).size} items · Last ${retention} days` : `Hidden updates · Retained for ${retention} days`;
   const discovery = `Discovery is incomplete. ${windows.jira_comment_discovery_enabled === false ? "Jira comment discovery is off until project keys are configured." : `Jira looks back ${windows.jira_mentions_days ?? 30} days for mentions/replies and ${windows.jira_participation_days ?? 90} days for participation, in configured projects.`} ADO checks comments from the last ${windows.ado_mentions_days ?? 30} days on retrieved work. Queries are capped at ${windows.jira_query_cap ?? 1000} Jira results per query, ${windows.ado_item_cap ?? 1000} ADO work items, ${windows.ado_comment_cap ?? 250} ADO comment candidates, and 100 PRs per role. ADO followed subscriptions are not collected.`;
-  $("#windowDetails").textContent = state.view === 'work' ? `These limits affect finding items, not how long tracked items stay. ${discovery}` : state.view === 'updates' ? `Only captured events from the last ${retention} days are kept—not every change in the source. ${discovery} ADO revision details and local comparisons are limited; open the source for full history.` : `Hidden updates expire ${retention} days after the event, not after hiding. Expired events cannot be restored. Hidden work items stay hidden until restored and have no age cutoff.`;
+  $("#windowDetails").textContent = state.view === 'work' ? `These limits affect finding items, not how long tracked items stay. ${discovery}` : state.view === 'updates' ? `Captured events from the last ${retention} days are kept. ${discovery} ADO change details continue loading across refreshes. Long text and rich-text changes show field names; open the source for their contents and full history.` : `Hidden updates expire ${retention} days after the event, not after hiding. Expired events cannot be restored. Hidden work items stay hidden until restored and have no age cutoff.`;
   const progress = data.health?.jira?.coverage?.completed_history;
-  $("#historyProgress").hidden = !progress;
+  const adoProgress = data.health?.azure_devops?.coverage?.history_progress;
+  $("#historyProgress").hidden = !progress && !adoProgress;
   const historyDiscovery = data.health?.jira?.coverage?.history_discovery;
-  if (progress) $("#historyProgress").textContent = `Jira older history: ${progress.checked} of ${progress.total} discovered tickets checked this pass · ${progress.remaining} remaining · ${progress.batches_remaining} batches${progress.failed ? " · ETA unavailable until failed checks recover" : progress.remaining ? ` · Estimated ${Math.ceil(progress.eta_seconds / 60)} min for these discovered tickets while running` : ' · Discovered-ticket pass complete'}${progress.failed ? ` · ${progress.failed} checks failed and will be retried` : ''}. ${historyDiscovery ? `Discovery: ${historyDiscovery.roles_with_completed_pass} of ${historyDiscovery.total_roles} relationship searches have completed an all-time pass; additional source tickets remaining are unknown. Progress is saved across restarts.` : 'This is not all-time discovery progress.'}`;
+  const historyMessages = [];
+  if (progress) historyMessages.push(`Jira older history: ${progress.checked} of ${progress.total} discovered tickets checked this pass · ${progress.remaining} remaining · ${progress.batches_remaining} batches${progress.failed ? " · ETA unavailable until failed checks recover" : progress.remaining ? ` · Estimated ${Math.ceil(progress.eta_seconds / 60)} min for these discovered tickets while running` : ' · Discovered-ticket pass complete'}${progress.failed ? ` · ${progress.failed} checks failed and will be retried` : ''}. ${historyDiscovery ? `Discovery: ${historyDiscovery.roles_with_completed_pass} of ${historyDiscovery.total_roles} relationship searches have completed an all-time pass; additional source tickets remaining are unknown. Progress is saved across restarts.` : 'This is not all-time discovery progress.'}`);
+  if (adoProgress) historyMessages.push(`ADO change details: ${adoProgress.checked ?? 0} of ${adoProgress.total ?? 0} tracked items checked · ${adoProgress.remaining ?? 0} remaining${adoProgress.failed ? ` · ${adoProgress.failed} ${adoProgress.failed === 1 ? 'check' : 'checks'} failed and will be retried` : ''}${adoProgress.pending ? ` · ${adoProgress.pending} items waiting for details` : ''}${adoProgress.unavailable ? ` · Details unavailable for ${adoProgress.unavailable} ${adoProgress.unavailable === 1 ? 'item' : 'items'}` : ''}. Progress is saved across restarts.`);
+  if (historyMessages.length) $("#historyProgress").textContent = historyMessages.join(' ');
   const guide = viewGuides[state.view];
   $("#helpTitle").textContent = `About ${views[state.view][0]}`;
   $("#aboutView").textContent = `About ${views[state.view][0]}`;

@@ -20,13 +20,20 @@ class RefreshCoordinator:
         self._stop = asyncio.Event()
         self._persistence_errors: dict[str, ConnectorHealth] = {}
         self.connectors = [
-            AzureDevOpsConnector(settings.azure_devops, settings.app.connector_timeout_seconds),
+            AzureDevOpsConnector(settings.azure_devops, settings.app.connector_timeout_seconds,
+                                 retention_days=settings.app.activity_retention_days),
             JiraConnector(settings.jira, settings.app.connector_timeout_seconds),
         ]
         for connector in self.connectors:
             connector.scope_verified = lambda cache_scope, name=connector.name: self._activate_scope(
                 name, cache_scope
             )
+        self.connectors[0].state_loader = lambda cache_scope: self.store.load_connector_state(
+            'azure_devops', cache_scope=cache_scope
+        )
+        self.connectors[0].history_inventory_loader = lambda cache_scope: self.store.history_inventory(
+            'azure_devops', cache_scope=cache_scope
+        )
         self.connectors[1].state_loader = lambda cache_scope: self.store.load_connector_state(
             'jira', cache_scope=cache_scope
         )
@@ -77,7 +84,7 @@ class RefreshCoordinator:
             if isinstance(connector, JiraConnector):
                 connector.load_state(self.store.load_connector_state("jira"))
             timeout = (self.settings.jira.refresh_timeout_seconds if connector.name == "jira"
-                       else self.settings.app.connector_timeout_seconds) + 5
+                       else self.settings.azure_devops.refresh_timeout_seconds) + 5
             result = await asyncio.wait_for(
                 connector.refresh(), timeout=timeout
             )

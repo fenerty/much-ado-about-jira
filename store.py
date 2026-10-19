@@ -195,11 +195,50 @@ class Store:
                 (f"connector_state:{storage}", payload),
             )
 
+    def history_inventory(self, connector: str = 'azure_devops', *,
+                          cache_scope: str | None = None) -> list[dict]:
+        """Return raw, account-scoped parents needed to recover retained history.
+
+        Hidden updates and inactive work remain eligible for recovery. Reading
+        this inventory never reactivates work or changes its local triage.
+        """
+        storage = self._verified_connector(connector, cache_scope)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute('''
+                SELECT entity_kind, payload_json, active FROM entities
+                WHERE connector = ? AND source = 'ado'
+            ''', (storage,)).fetchall()
+        parents = {}
+        retained: dict[str, str] = {}
+        for row in rows:
+            raw = json.loads(row['payload_json'])
+            if row['entity_kind'] == 'activity':
+                if raw.get('event_type') == 'updated':
+                    key = raw.get('item_id')
+                    timestamp = raw.get('timestamp')
+                    if key and timestamp:
+                        old = retained.get(key)
+                        if old is None or datetime.fromisoformat(timestamp) > datetime.fromisoformat(old):
+                            retained[key] = timestamp
+            elif raw.get('id', '').startswith('ado:workitem:'):
+                raw['metadata'] = {**raw.get('metadata', {}), 'snapshot_only': not bool(row['active'])}
+                parents[raw['id']] = (raw, bool(row['active']))
+        inventory = []
+        for key, (raw, active) in sorted(parents.items()):
+            if active or key in retained:
+                if key in retained:
+                    raw['metadata']['latest_activity_at'] = retained[key]
+                inventory.append(raw)
+        return inventory
+
     @staticmethod
     def _activity_version(raw: dict) -> str:
         # Relationships describe why an event is relevant now, not what changed
         # in the source. Lookback expiry must not reset read or hidden state.
-        content = {key: value for key, value in raw.items() if key not in {'reasons', 'unread'}}
+        # Capture provenance/status are not source edits. Excluding new optional
+        # fields also preserves hashes from payloads written before they existed.
+        metadata = {'detail_status', 'source_update_id', 'source_revision', 'legacy_activity_id'}
+        content = {key: value for key, value in raw.items() if key not in {'reasons', 'unread'} | metadata}
         payload = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
@@ -305,9 +344,74 @@ class Store:
                    else hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24])
         return payload, version
 
+    @staticmethod
+    def _ado_update(raw: dict) -> bool:
+        update_id = raw.get('source_update_id')
+        return (raw.get('source') == 'ado' and raw.get('event_type') == 'updated'
+                and isinstance(update_id, int) and not isinstance(update_id, bool)
+                and update_id > 0
+                and raw.get('detail_status') in {'captured', 'administrative'})
+
+    @staticmethod
+    def _same_ado_parent(before: dict, after: dict) -> bool:
+        return all(before.get(key) == after.get(key)
+                   for key in ('source', 'event_type', 'item_id', 'item_key'))
+
+    @staticmethod
+    def _same_event_time(before: dict, after: dict) -> bool:
+        try:
+            return datetime.fromisoformat(before['timestamp']) == datetime.fromisoformat(after['timestamp'])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _prepare_ado_activity(self, storage: str, activity: Activity,
+                              previous: list[dict]) -> tuple[Activity, bool]:
+        """Resolve only proven ADO identities; keep existing local IDs and tokens.
+
+        A revision is not an update ID, and matching timestamps alone do not
+        establish identity. The connector must supply the exact old timestamp
+        ID from the authoritative ChangedDate delta before an alias is adopted.
+        """
+        if storage.split('@', 1)[0] != 'azure_devops' or activity.source != 'ado' or activity.event_type != 'updated':
+            return activity, False
+        incoming = activity.model_dump(mode='json')
+        matching = [raw for raw in previous if self._same_ado_parent(raw, incoming)]
+        if self._ado_update(incoming):
+            for raw in matching:
+                if self._ado_update(raw) and raw['source_update_id'] == activity.source_update_id:
+                    return activity.model_copy(update={
+                        'id': raw['id'],
+                        'legacy_activity_id': raw.get('legacy_activity_id') or activity.legacy_activity_id,
+                    }), True
+            alias = activity.legacy_activity_id
+            expected_alias = f"{activity.item_id}:updated:{activity.timestamp.isoformat()}"
+            canonical = f"{activity.item_id}:update:{activity.source_update_id}"
+            if alias and alias == expected_alias and activity.id == canonical:
+                for raw in matching:
+                    if (raw.get('id') == alias and raw.get('source_update_id') is None
+                            and self._same_event_time(raw, incoming)):
+                        return activity.model_copy(update={'id': alias}), True
+        elif incoming.get('source_update_id') is None:
+            # Current item queries still emit their generic snapshot event.
+            # Keep previously recovered authoritative contents and identity so
+            # that a later cursor-only refresh cannot erase the enrichment.
+            for raw in matching:
+                if (self._ado_update(raw)
+                        and activity.id in {raw.get('id'), raw.get('legacy_activity_id')}
+                        and self._same_event_time(raw, incoming)):
+                    saved = Activity.model_validate(raw)
+                    return saved.model_copy(update={
+                        'reasons': activity.reasons, 'item_title': activity.item_title,
+                        'url': activity.url,
+                    }), True
+        return activity, False
+
     def replace_connector(self, result: ConnectorResult, retention_days: int) -> None:
         now = utc_now().isoformat()
         storage = self._verified_connector(result.connector, result.cache_scope)
+        if result.checkpoint is not None and not isinstance(result.checkpoint, dict):
+            raise TypeError('Connector checkpoint must be a dictionary')
+        checkpoint = json.dumps(result.checkpoint, sort_keys=True) if result.checkpoint is not None else None
         baseline_key = f"baseline:{storage}"
         with self._lock:
             with self._connect() as connection:
@@ -333,13 +437,23 @@ class Store:
                 current_items = {item.id: item.model_dump(mode='json') for item in result.work_items}
                 for item in result.work_items:
                     self._upsert_entity(connection, storage, "work_item", item, item.updated_at, now)
+                ado_history: dict[str, list[dict]] = {}
+                if result.connector == 'azure_devops':
+                    for row in connection.execute('''
+                        SELECT payload_json FROM entities
+                        WHERE connector = ? AND source = 'ado' AND entity_kind = 'activity'
+                    ''', (storage,)):
+                        raw = json.loads(row['payload_json'])
+                        ado_history.setdefault(raw['item_id'], []).append(raw)
                 for activity in result.activities:
+                    activity, preserve_version = self._prepare_ado_activity(
+                        storage, activity, ado_history.get(activity.item_id, []))
                     if activity.item_id not in previous_items and activity.item_id not in current_items:
                         parent = WorkItem(id=activity.item_id, source=activity.source, source_type='unknown', project='', key=activity.item_key, title=activity.item_title, url=activity.url, status='Unknown', updated_at=activity.timestamp, reasons=activity.reasons, metadata={'discovered_from_update': True})
                         self._upsert_entity(connection, storage, 'work_item', parent, parent.updated_at, now)
                         connection.execute('UPDATE entities SET active = 0 WHERE entity_id = ?', (self._entity_id(storage, parent.id),))
                         previous_items[parent.id] = parent.model_dump(mode='json')
-                    if activity.event_type == 'updated' and not activity.changes:
+                    if activity.event_type == 'updated' and not activity.changes and not self._ado_update(activity.model_dump(mode='json')):
                         existing = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity'", (self._entity_id(storage, activity.id),)).fetchone()
                         saved = json.loads(existing['payload_json']) if existing else {}
                         if saved.get('changes'):
@@ -351,8 +465,13 @@ class Store:
                                 if changes:
                                     activity = activity.model_copy(update={'changes': changes, 'detail_source': 'Between local refreshes', 'summary': '; '.join(changes)})
                     self._upsert_entity(
-                        connection, storage, "activity", activity, activity.timestamp, now
+                        connection, storage, "activity", activity, activity.timestamp, now,
+                        preserve_activity_version=preserve_version,
                     )
+                    if result.connector == 'azure_devops' and activity.source == 'ado':
+                        previous = ado_history.setdefault(activity.item_id, [])
+                        previous[:] = [raw for raw in previous if raw['id'] != activity.id]
+                        previous.append(activity.model_dump(mode='json'))
 
                 if baseline is None:
                     legacy_bound = self._legacy_read_bound(connection, storage)
@@ -382,6 +501,11 @@ class Store:
                     connection.execute("DELETE FROM local_state WHERE entity_id IN (SELECT entity_id FROM entities WHERE connector = ? AND entity_kind = 'activity' AND event_at < ?)", (storage, cutoff))
                     connection.execute("DELETE FROM entities WHERE connector = ? AND entity_kind = 'activity' AND event_at < ?", (storage, cutoff))
                 self._write_health(connection, result.health, storage)
+                if checkpoint is not None:
+                    connection.execute('''
+                        INSERT INTO app_meta(key, value) VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    ''', (f'connector_state:{storage}', checkpoint))
 
             if self._cache_bindings is not None:
                 self._active_connectors[result.connector] = storage
@@ -394,6 +518,8 @@ class Store:
         model: WorkItem | Activity,
         event_at: datetime,
         now: str,
+        *,
+        preserve_activity_version: bool = False,
     ) -> None:
         payload, version = self._payload(model)
         entity_id = self._entity_id(connector, model.id)
@@ -402,7 +528,7 @@ class Store:
                 "SELECT payload_json, version_hash FROM entities WHERE entity_id = ?",
                 (entity_id,),
             ).fetchone()
-            if previous and self._activity_version(json.loads(previous['payload_json'])) == version:
+            if previous and (preserve_activity_version or self._activity_version(json.loads(previous['payload_json'])) == version):
                 # Reuse legacy full-payload versions until source content changes.
                 # This preserves seen/dismissed versions and outstanding Undo tokens
                 # without migrating or guessing previously acknowledged content.

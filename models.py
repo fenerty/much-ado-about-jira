@@ -49,6 +49,10 @@ class Activity(BaseModel):
     summary: str
     changes: list[str] = Field(default_factory=list)
     detail_source: str | None = None
+    detail_status: Literal["pending", "captured", "failed", "administrative", "unavailable"] | None = None
+    source_update_id: int | None = None
+    source_revision: int | None = None
+    legacy_activity_id: str | None = None
     url: str
     reasons: list[str] = Field(default_factory=list)
     unread: bool = False
@@ -67,6 +71,7 @@ class ConnectorHealth(BaseModel):
 class ConnectorResult(BaseModel):
     connector: Literal["azure_devops", "jira"]
     cache_scope: str | None = None
+    checkpoint: dict[str, Any] | None = None
     work_items: list[WorkItem] = Field(default_factory=list)
     activities: list[Activity] = Field(default_factory=list)
     health: ConnectorHealth

@@ -16,6 +16,11 @@ cli_path = ""
 mention_reply_days = 30
 max_work_items = 1000
 max_comment_candidates = 250
+# Saved history pages rotate across current and retained work, including Hidden.
+refresh_timeout_seconds = 60
+history_timeout_seconds = 10
+history_batch_size = 50
+history_page_size = 100
 
 [jira]
 enabled = false
