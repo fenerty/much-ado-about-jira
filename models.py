@@ -50,7 +50,7 @@ class Activity(BaseModel):
     changes: list[str] = Field(default_factory=list)
     detail_source: str | None = None
     detail_status: Literal["pending", "captured", "failed", "administrative", "unavailable"] | None = None
-    source_update_id: int | None = None
+    source_update_id: int | str | None = None
     source_revision: int | None = None
     legacy_activity_id: str | None = None
     url: str

@@ -104,13 +104,14 @@ def test_failed_page_does_not_advance_and_retry_uses_same_position(monkeypatch):
 
     async def denied(client, method, url, **kwargs):
         request = httpx.Request("GET", url)
-        response = httpx.Response(403, request=request)
+        response = httpx.Response(503, request=request)
         raise httpx.HTTPStatusError("Access denied", request=request, response=response)
 
     monkeypatch.setattr(target, "_json", denied)
     assert asyncio.run(target._capture_history(None, [item()])) == []
     assert target.checkpoint()["records"]["1"]["offset"] == 2
     assert target._history_coverage["failed"] == 1
+    target._history.records["1"]["retry_at"] = ""
     calls = server(monkeypatch, target, rows)
     retried = asyncio.run(target._capture_history(None, [item()]))
     assert calls == [("1", 2, 2)]
@@ -135,7 +136,7 @@ def test_transient_rate_limit_is_retried_within_history_budget(monkeypatch):
     assert len(calls) == 2
 
 
-def test_timeout_is_visible_and_rotation_moves_past_slow_item(monkeypatch):
+def test_phase_deadline_defers_without_failure_and_rotation_moves_past_slow_item(monkeypatch):
     target = connector(monkeypatch, history_timeout_seconds=.02, history_batch_size=1)
 
     async def slow(client, method, url, **kwargs):
@@ -143,7 +144,9 @@ def test_timeout_is_visible_and_rotation_moves_past_slow_item(monkeypatch):
 
     monkeypatch.setattr(target, "_json", slow)
     assert asyncio.run(target._capture_history(None, [item("1"), item("2")])) == []
-    assert target._history_coverage["failed"] == 1
+    assert target._history_coverage["failed"] == 0
+    assert target._history_coverage["budget_deferred"] == 1
+    assert target._history_coverage["pending"] == 2
     calls = server(monkeypatch, target, {"2": [update(1)]})
     result = asyncio.run(target._capture_history(None, [item("1"), item("2")]))
     assert result[0].item_key == "2"
@@ -373,7 +376,7 @@ def test_generic_placeholder_summary_is_legacy_exact_for_pending_and_failure(mon
     monkeypatch.setattr(target, "_json", denied)
     _, events, _ = asyncio.run(target._work_items(None, {}))
     assert [event.summary for event in events] == ["User Story updated", "User Story updated"]
-    assert [event.detail_status for event in events] == ["failed", "pending"]
+    assert [event.detail_status for event in events] == ["unavailable", "pending"]
 
 
 def test_cancellation_replays_from_last_committed_checkpoint(monkeypatch):

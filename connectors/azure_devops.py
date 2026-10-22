@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import math
 import os
 import re
 import shutil
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -24,6 +26,14 @@ from .ado_history import AdoHistory
 
 ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
 API_VERSION = "7.1"
+# Optional history reads should not repeatedly spend the foreground refresh
+# budget on work that the source currently cannot expose. They remain retryable.
+HISTORY_UNAVAILABLE_RETRY_SECONDS = 1800
+HISTORY_TRANSIENT_RETRY_SECONDS = 30
+
+
+class HistoryBudgetDeferred(Exception):
+    """The shared history phase ended without establishing a failed read."""
 
 
 class AzureDevOpsConnector:
@@ -98,6 +108,8 @@ class AzureDevOpsConnector:
                 if (self._history_coverage.get('failed') or self._history_coverage.get('inventory_failed')
                         or self._history_coverage.get('metadata_status') == 'failed'):
                     message = "Azure DevOps work refreshed; some change details could not be read and will retry"
+                elif self._history_coverage.get('deleted') or self._history_coverage.get('inaccessible'):
+                    message = "Azure DevOps work refreshed; some tracked items are deleted or inaccessible; availability will be rechecked"
                 elif self._history_coverage.get('unavailable'):
                     message = "Azure DevOps work refreshed; some update timestamps are unavailable"
                 else:
@@ -248,11 +260,13 @@ class AzureDevOpsConnector:
         assert_ado_read_operation(method, url)
         response = await client.request(method, url, json=body)
         if response.status_code in {401, 403}:
-            raise ConnectorFailure(
+            failure = ConnectorFailure(
                 "ADO_ACCESS_DENIED",
                 "Azure DevOps authentication or organization access is required",
                 auth_required=True,
             )
+            failure.http_status = response.status_code
+            raise failure
         response.raise_for_status()
         payload = response.json()
         return (payload if isinstance(payload, dict) else {"value": payload}), response.headers
@@ -458,6 +472,8 @@ class AzureDevOpsConnector:
             status = progress.get("status", "pending")
             if status == "failed":
                 activity.detail_status = "failed"
+            elif status in {"deleted", "inaccessible"}:
+                activity.detail_status = "unavailable"
             elif status in {"captured", "unavailable"} and progress.get("latest_changed_date") != activity.timestamp.isoformat():
                 activity.detail_status = "unavailable"
         candidates = candidates[: self.settings.max_comment_candidates]
@@ -482,36 +498,92 @@ class AzureDevOpsConnector:
 
     async def _history_json(self, client: httpx.AsyncClient, url: str, deadline: float) -> dict:
         """Retry transient history reads within the shared, bounded budget."""
+        last_failure = None
         for attempt in range(2):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("ADO history budget exhausted")
+                if last_failure is not None:
+                    raise last_failure
+                raise HistoryBudgetDeferred()
+            request_timeout = min(float(self.timeout_seconds), float(self.settings.history_request_timeout_seconds))
+            phase_limited = remaining < request_timeout
             try:
                 data, _ = await asyncio.wait_for(
-                    self._json(client, "GET", url), min(float(self.timeout_seconds), 2.0, remaining)
+                    self._json(client, "GET", url), min(request_timeout, remaining)
                 )
                 return data
             except (httpx.HTTPError, TimeoutError) as exc:
+                # A request cut short only by the shared batch deadline has not
+                # reached its own timeout. Continue it next batch as normal work.
+                if isinstance(exc, TimeoutError) and phase_limited:
+                    if last_failure is not None:
+                        raise last_failure
+                    raise HistoryBudgetDeferred() from None
                 status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-                retryable = status is None or status == 429 or status >= 500
+                retryable = status is None or status in {408, 429} or status >= 500
                 if not retryable or attempt:
                     raise
-                delay = 0.1
-                if isinstance(exc, httpx.HTTPStatusError):
-                    try:
-                        delay = max(delay, float(exc.response.headers.get("Retry-After", "0")))
-                    except ValueError:
-                        pass
+                last_failure = exc
+                delay = max(0.1, self._history_retry_after(exc))
                 if deadline - time.monotonic() <= delay:
                     raise
                 await asyncio.sleep(delay)
         raise RuntimeError("Unreachable history retry")
+
+    @staticmethod
+    def _history_retry_after(exc: Exception) -> float:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return 0
+        value = exc.response.headers.get("Retry-After", "")
+        try:
+            seconds = float(value)
+            return min(86400.0, max(0.0, seconds)) if math.isfinite(seconds) else 0
+        except ValueError:
+            try:
+                stamp = parsedate_to_datetime(value)
+                return min(86400.0, max(0.0, (stamp - utc_now()).total_seconds()))
+            except (ValueError, TypeError, OverflowError):
+                return 0
+
+    @staticmethod
+    def _history_failure(exc: Exception) -> tuple[str, str]:
+        if isinstance(exc, ConnectorFailure):
+            status = getattr(exc, "http_status", None)
+            if status in {401, 403}:
+                return f"HTTP_{status}", "inaccessible"
+            return exc.code, "inaccessible" if exc.code == "ADO_ACCESS_DENIED" else "read_error"
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            category = ("transient" if status in {408, 429} or status >= 500
+                        else "inaccessible" if status in {401, 403, 404, 410} else "read_error")
+            return f"HTTP_{status}", category
+        if isinstance(exc, (TimeoutError, httpx.TransportError)):
+            return type(exc).__name__, "transient"
+        return type(exc).__name__, "invalid_response" if isinstance(exc, (ValueError, TypeError)) else "read_error"
+
+    def _history_retry_seconds(self, category: str, failures: int, exc: Exception) -> float:
+        if category in {"deleted", "inaccessible"}:
+            return HISTORY_UNAVAILABLE_RETRY_SECONDS
+        return max(self._history_retry_after(exc), min(900, HISTORY_TRANSIENT_RETRY_SECONDS * 2 ** min(failures, 5)))
+
+    async def _history_deleted(self, client: httpx.AsyncClient, key: str, deadline: float) -> bool:
+        """Only a successful matching recycle-bin response establishes deletion."""
+        try:
+            data = await self._history_json(
+                client, f"{self.base_url}/_apis/wit/recyclebin/{key}?api-version={API_VERSION}", deadline
+            )
+            identifier = data.get("id")
+            return not isinstance(identifier, bool) and str(identifier) == key
+        except (httpx.HTTPError, ConnectorFailure, HistoryBudgetDeferred, TimeoutError, ValueError, TypeError):
+            return False
 
     async def _history_metadata(self, client: httpx.AsyncClient, deadline: float) -> str:
         history = self._ensure_history()
         updated = parse_datetime(history.metadata_at)
         if history.field_metadata and updated and updated >= utc_now() - timedelta(days=1):
             return "cached"
+        if not AdoHistory.due(history.metadata_diagnostic):
+            return "failed"
         try:
             data = await self._history_json(
                 client, f"{self.base_url}/_apis/wit/fields?api-version={API_VERSION}", deadline
@@ -532,13 +604,26 @@ class AzureDevOpsConnector:
                 # Revisit stable update IDs after a catalogue recovery/change so
                 # earlier fallback formatting can be enriched in place.
                 for record in history.records.values():
-                    record.update(offset=0, seen={}, status="pending", undated=[], latest_changed_date="")
+                    status = record["status"] if record["status"] in {"deleted", "inaccessible"} else "pending"
+                    record.update(offset=0, retry_offset=None, seen={}, status=status, undated=[], latest_changed_date="")
             history.field_metadata = sanitized
             history.metadata_at = utc_now().isoformat()
+            history.metadata_diagnostic = AdoHistory.sanitize_diagnostic({})
             return "captured"
-        except (httpx.HTTPError, ConnectorFailure, TimeoutError, ValueError):
+        except HistoryBudgetDeferred:
+            return "pending"
+        except (httpx.HTTPError, ConnectorFailure, TimeoutError, ValueError, TypeError) as exc:
             # Parsing can safely derive field labels and body-only markers even
             # if the organization denies its field catalogue.
+            code, category = self._history_failure(exc)
+            failures = history.metadata_diagnostic.get("consecutive_failures", 0)
+            now = utc_now()
+            history.metadata_diagnostic = AdoHistory.sanitize_diagnostic({
+                "error_code": code, "failure_category": category,
+                "last_failure_at": now.isoformat(),
+                "retry_at": (now + timedelta(seconds=self._history_retry_seconds(category, failures, exc))).isoformat(),
+                "consecutive_failures": failures + 1,
+            })
             return "failed"
 
     @staticmethod
@@ -579,12 +664,20 @@ class AzureDevOpsConnector:
         history.set_retention_days(self.retention_days)
         cutoff = utc_now() - timedelta(days=self.retention_days)
         candidates = list(items)
+        visible_keys = {target["key"] for value in items
+                        if (target := self._history_target(value)) and not target["snapshot_only"]}
         inventory_failed = False
         if include_inventory and self.history_inventory_loader is not None and self.verified_cache_scope:
             try:
                 candidates = list(self.history_inventory_loader(self.verified_cache_scope)) + candidates
-            except (ValueError, OSError, TypeError):
+                history.inventory_diagnostic = AdoHistory.sanitize_diagnostic({})
+            except (ValueError, OSError, TypeError) as exc:
                 inventory_failed = True
+                history.inventory_diagnostic = AdoHistory.sanitize_diagnostic({
+                    "error_code": type(exc).__name__, "failure_category": "read_error",
+                    "last_failure_at": utc_now().isoformat(),
+                    "consecutive_failures": history.inventory_diagnostic.get("consecutive_failures", 0) + 1,
+                })
         targets = {}
         for value in candidates:
             target = self._history_target(value)
@@ -593,14 +686,21 @@ class AzureDevOpsConnector:
         # An inventory outage must not discard cursors for retained items.
         history.prepare(set(targets) | (set(history.records) if inventory_failed else set()), cutoff)
         for key, target in targets.items():
-            history.observe(key, target["updated_at"])
+            history.observe(key, target["updated_at"], currently_visible=key in visible_keys)
         deadline = time.monotonic() + self.settings.history_timeout_seconds
-        metadata_status = await self._history_metadata(client, deadline) if targets else "not_needed"
+        # The catalogue is optional: fallback labels still allow update pages
+        # to be captured. Reserve at least half of this phase for those pages so
+        # a slow catalogue cannot prevent history progress on every refresh.
+        metadata_started = time.monotonic()
+        metadata_deadline = metadata_started + max(0, deadline - metadata_started) / 2
+        metadata_status = await self._history_metadata(client, metadata_deadline) if targets else "not_needed"
         events: list[Activity] = []
         pages = attempted = 0
+        budget_deferred = int(metadata_status == "pending")
         page_size = self.settings.history_page_size
         for key in history.batch(self.settings.history_batch_size):
             if time.monotonic() >= deadline:
+                budget_deferred += 1
                 break
             target = targets.get(key)
             if target is None:
@@ -676,21 +776,38 @@ class AzureDevOpsConnector:
                 history.accept(key, offset, len(rows), page_size, seen, latest_changed_date, undated, resolved)
                 events.extend(page_events.values())
                 pages += 1
+            except HistoryBudgetDeferred:
+                budget_deferred += 1
+                break
             except (httpx.HTTPError, ConnectorFailure, TimeoutError, ValueError, TypeError) as exc:
-                code = exc.code if isinstance(exc, ConnectorFailure) else (
-                    f"HTTP_{exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-                )
-                history.fail(key, code)
+                code, category = self._history_failure(exc)
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+                    if await self._history_deleted(client, key, deadline):
+                        code, category = "ADO_RECYCLE_BIN_CONFIRMED", "deleted"
+                    else:
+                        code = "HTTP_404_UNCONFIRMED"
+                retry = self._history_retry_seconds(category, history.records[key].get("consecutive_failures", 0), exc)
+                history.fail(key, code, category=category, retry_seconds=retry, retry_offset=offset)
         counts = {status: sum(record["status"] == status for record in history.records.values())
-                  for status in ("captured", "pending", "failed", "unavailable")}
+                  for status in ("captured", "pending", "failed", "unavailable", "deleted", "inaccessible")}
         remaining = counts["pending"] + counts["failed"]
+        diagnostics = [{"item_key": key, **AdoHistory.sanitize_diagnostic(record)}
+                       for key, record in sorted(history.records.items())
+                       if record["status"] in {"failed", "deleted", "inaccessible"}]
         self._history_coverage = {
-            "total": len(history.records), "checked": counts["captured"] + counts["unavailable"],
+            "total": len(history.records), "checked": counts["captured"] + counts["unavailable"] + counts["deleted"] + counts["inaccessible"],
             "remaining": remaining, **counts, "pages": pages, "attempted": attempted, "events": len(events),
             "retention_days": self.retention_days, "metadata_status": metadata_status,
             "inventory_failed": inventory_failed,
+            "inventory_diagnostic": history.inventory_diagnostic if inventory_failed else {},
+            "metadata_diagnostic": history.metadata_diagnostic if metadata_status == "failed" else {},
+            "failure_diagnostics": diagnostics[:50],
+            "failure_diagnostics_truncated": len(diagnostics) > 50,
+            "cooling_down": sum(not AdoHistory.due(record) for record in history.records.values()),
+            "budget_deferred": budget_deferred,
             "unavailable_timestamps": sum(len(record["undated"]) for record in history.records.values()),
-            "incomplete": bool(remaining or counts["unavailable"] or metadata_status == "failed" or inventory_failed),
+            "incomplete": bool(remaining or counts["unavailable"] or counts["deleted"] or counts["inaccessible"]
+                               or metadata_status in {"failed", "pending"} or inventory_failed),
         }
         return events
 

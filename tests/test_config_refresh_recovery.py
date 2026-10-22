@@ -96,11 +96,15 @@ async def test_failed_cache_write_remains_visible_without_blocking_the_other_sou
         return ConnectorResult(connector='azure_devops', health=ConnectorHealth(connector='azure_devops', state='ok', message='Fresh', last_success_at=utc_now()))
 
     async def jira_refresh():
-        return result(make_item())
+        return result(make_item()).model_copy(update={'checkpoint': {'cursor': 'saved'}})
 
     monkeypatch.setattr(ado, 'refresh', ado_refresh)
     monkeypatch.setattr(jira, 'refresh', jira_refresh)
-    monkeypatch.setattr(jira, 'checkpoint', lambda: {'cursor': 'saved'})
+    # Jira progress must be committed with its returned entities, never by a
+    # second independently successful write after the snapshot transaction.
+    def reject_separate_save(*args, **kwargs):
+        raise AssertionError('checkpoint must be committed atomically')
+    monkeypatch.setattr(store, 'save_connector_state', reject_separate_save)
     original_replace = store.replace_connector
 
     def failed_ado_write(snapshot, retention):

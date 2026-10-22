@@ -162,6 +162,10 @@ function rowTemplate(item) {
     </a><div class="row-side"><span class="age" title="${escapeHtml(timestamp ? new Date(timestamp).toLocaleString() : "Not available")}">${escapeHtml(relativeTime(timestamp))}</span><div class="row-actions">${rowActions}</div></div></article>`;
 }
 function updateDescription(item) {
+  if (item.source === 'jira' && item.event_type === 'updated' && !item.changes?.length
+      && (!item.detail_status || item.detail_status === 'unavailable')) {
+    return "Update detected · changed fields were not captured";
+  }
   const descriptions = {
     pending: "Update detected · change details pending",
     failed: "Change details could not be loaded · will retry",
@@ -174,13 +178,16 @@ function updateDescription(item) {
 function routineHistory(item) {
   const queries = item.coverage?.unavailable_queries || [];
   const adoHistory = item.coverage?.history_progress;
-  if (item.connector === 'azure_devops') return item.state === 'partial' && adoHistory && adoHistory.remaining > 0 && !adoHistory.failed && !adoHistory.unavailable && !adoHistory.inventory_failed && adoHistory.metadata_status !== 'failed' && !item.coverage?.work_query_incomplete && !item.coverage?.pull_request_query_incomplete && !queries.length;
-  return item.state === 'partial' && item.coverage?.completed_history && queries.length > 0 && queries.every(query => query === 'closed_history:rotating_batch');
+  if (item.connector === 'azure_devops') return item.state === 'partial' && adoHistory && (adoHistory.remaining > 0 || adoHistory.budget_deferred > 0 || adoHistory.metadata_status === 'pending') && !adoHistory.failed && !adoHistory.unavailable && !adoHistory.deleted && !adoHistory.inaccessible && !adoHistory.inventory_failed && adoHistory.metadata_status !== 'failed' && !item.coverage?.work_query_incomplete && !item.coverage?.pull_request_query_incomplete && !queries.length;
+  const changelog = item.coverage?.changelog;
+  const healthyChangelog = !changelog?.enabled || (['ok','updating'].includes(changelog.state) && !changelog.failed && !changelog.unavailable && !changelog.inventory_failed);
+  return item.state === 'partial' && healthyChangelog && queries.every(query => ['closed_history:rotating_batch','changelog:rotating_batch'].includes(query))
+    && ((item.coverage?.completed_history && queries.length > 0) || changelog?.state === 'updating');
 }
 function renderHealth(health) {
   const values = Object.values(health || {});
   const labels = {ok:"Synced",partial:"Partial coverage",error:"Sync failed",auth_required:"Sign-in needed",disabled:"Disabled",loading:"Loading"};
-  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${routineHistory(item) ? item.connector === 'azure_devops' ? "Synced · change details updating" : "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
+  $("#health").innerHTML = values.map(item => `<span class="health-chip ${escapeHtml(item.state)}" title="${escapeHtml(item.message)}"><span class="health-dot" aria-hidden="true"></span>${item.connector === "azure_devops" ? "ADO" : "Jira"} · ${routineHistory(item) ? item.connector === 'azure_devops' ? "Synced · change details updating" : item.coverage?.changelog?.state === 'updating' ? "Synced · field history updating" : "Synced · older history updating" : labels[item.state] || "Unknown"}${item.last_success_at ? ` · ${relativeTime(item.last_success_at)}` : ""}</span>`).join("");
   const impaired = values.filter(item => ["error","auth_required"].includes(item.state) || item.state === "partial" && !routineHistory(item));
   $("#notice").hidden = !impaired.length;
   $("#notice").textContent = impaired.map(item => `${item.connector === "azure_devops" ? "ADO" : "Jira"}: ${item.message}`).join(" · ");
@@ -209,14 +216,40 @@ function render() {
   const retention = data.activity_retention_days || 60;
   $("#coverageSummary").textContent = state.view === 'work' ? 'Tracked items · No age cutoff' : state.view === 'updates' ? `${data.activity.length} updates · ${new Set(data.activity.map(item => item.item_id)).size} items · Last ${retention} days` : `Hidden updates · Retained for ${retention} days`;
   const discovery = `Discovery is incomplete. ${windows.jira_comment_discovery_enabled === false ? "Jira comment discovery is off until project keys are configured." : `Jira looks back ${windows.jira_mentions_days ?? 30} days for mentions/replies and ${windows.jira_participation_days ?? 90} days for participation, in configured projects.`} ADO checks comments from the last ${windows.ado_mentions_days ?? 30} days on retrieved work. Queries are capped at ${windows.jira_query_cap ?? 1000} Jira results per query, ${windows.ado_item_cap ?? 1000} ADO work items, ${windows.ado_comment_cap ?? 250} ADO comment candidates, and 100 PRs per role. ADO followed subscriptions are not collected.`;
-  $("#windowDetails").textContent = state.view === 'work' ? `These limits affect finding items, not how long tracked items stay. ${discovery}` : state.view === 'updates' ? `Captured events from the last ${retention} days are kept. ${discovery} ADO change details continue loading across refreshes. Long text and rich-text changes show field names; open the source for their contents and full history.` : `Hidden updates expire ${retention} days after the event, not after hiding. Expired events cannot be restored. Hidden work items stay hidden until restored and have no age cutoff.`;
+  $("#windowDetails").textContent = state.view === 'work' ? `These limits affect finding items, not how long tracked items stay. ${discovery}` : state.view === 'updates' ? `Captured events from the last ${retention} days are kept. ${discovery} ADO and configured Jira change history load across refreshes. Without Jira change history, only differences between saved local snapshots can identify changed fields. Long text and rich-text changes show field names; open the source for their contents and full history.` : `Hidden updates expire ${retention} days after the event, not after hiding. Expired events cannot be restored. Hidden work items stay hidden until restored and have no age cutoff.`;
   const progress = data.health?.jira?.coverage?.completed_history;
   const adoProgress = data.health?.azure_devops?.coverage?.history_progress;
-  $("#historyProgress").hidden = !progress && !adoProgress;
+  const changelogProgress = data.health?.jira?.coverage?.changelog;
+  $("#historyProgress").hidden = !progress && !adoProgress && !changelogProgress;
   const historyDiscovery = data.health?.jira?.coverage?.history_discovery;
   const historyMessages = [];
   if (progress) historyMessages.push(`Jira older history: ${progress.checked} of ${progress.total} discovered tickets checked this pass · ${progress.remaining} remaining · ${progress.batches_remaining} batches${progress.failed ? " · ETA unavailable until failed checks recover" : progress.remaining ? ` · Estimated ${Math.ceil(progress.eta_seconds / 60)} min for these discovered tickets while running` : ' · Discovered-ticket pass complete'}${progress.failed ? ` · ${progress.failed} checks failed and will be retried` : ''}. ${historyDiscovery ? `Discovery: ${historyDiscovery.roles_with_completed_pass} of ${historyDiscovery.total_roles} relationship searches have completed an all-time pass; additional source tickets remaining are unknown. Progress is saved across restarts.` : 'This is not all-time discovery progress.'}`);
-  if (adoProgress) historyMessages.push(`ADO change details: ${adoProgress.checked ?? 0} of ${adoProgress.total ?? 0} tracked items checked · ${adoProgress.remaining ?? 0} remaining${adoProgress.failed ? ` · ${adoProgress.failed} ${adoProgress.failed === 1 ? 'check' : 'checks'} failed and will be retried` : ''}${adoProgress.pending ? ` · ${adoProgress.pending} items waiting for details` : ''}${adoProgress.unavailable ? ` · Details unavailable for ${adoProgress.unavailable} ${adoProgress.unavailable === 1 ? 'item' : 'items'}` : ''}. Progress is saved across restarts.`);
+  if (adoProgress) historyMessages.push(`ADO change details: ${adoProgress.checked ?? 0} of ${adoProgress.total ?? 0} tracked items checked · ${adoProgress.remaining ?? 0} remaining${adoProgress.failed ? ` · ${adoProgress.failed} ${adoProgress.failed === 1 ? 'check' : 'checks'} failed and will be retried` : ''}${adoProgress.pending ? ` · ${adoProgress.pending} items waiting for details` : ''}${adoProgress.deleted ? ` · ${adoProgress.deleted} source items deleted; saved history retained` : ''}${adoProgress.inaccessible ? ` · ${adoProgress.inaccessible} source items cannot currently be accessed` : ''}${adoProgress.cooling_down ? ` · ${adoProgress.cooling_down} rechecks scheduled after a retry delay` : ''}${adoProgress.budget_deferred ? ' · Batch time limit reached; remaining work continues next refresh' : ''}${adoProgress.unavailable ? ` · Details unavailable for ${adoProgress.unavailable} ${adoProgress.unavailable === 1 ? 'item' : 'items'}` : ''}. Progress is saved across restarts.`);
+  if (adoProgress?.failure_diagnostics?.length) {
+    const checks = adoProgress.failure_diagnostics.slice(0, 5).map(check => {
+      const retry = Date.parse(check.retry_at);
+      return `${check.item_key}: ${check.failure_category} (${check.error_code})${Number.isFinite(retry) ? `; next eligible check ${new Date(retry).toLocaleString()}` : ''}`;
+    });
+    historyMessages.push(`ADO checks: ${checks.join(' · ')}${adoProgress.failure_diagnostics.length > 5 || adoProgress.failure_diagnostics_truncated ? ' · More affected items are recorded in the local checkpoint' : ''}.`);
+  }
+  if (changelogProgress) {
+    const setupReasons = {
+      JIRA_CHANGELOG_TOKEN_UNAVAILABLE: 'Set JIRA_API_TOKEN in the app launcher environment to enable capture.',
+      JIRA_CHANGELOG_ACCOUNT_UNVERIFIED: 'Configure and verify the expected Jira account to enable capture.',
+      JIRA_CHANGELOG_IDENTITY_MISMATCH: 'The REST token belongs to a different Jira account; use the signed-in account.',
+      JIRA_CHANGELOG_INVALID_ORIGIN: 'Use the verified Jira HTTPS site URL without a path or query.',
+      JIRA_CHANGELOG_HTTP_401: 'The Jira API token was rejected; check its validity.',
+      JIRA_CHANGELOG_HTTP_403: 'Jira denied access to change history; check account permissions.',
+      JIRA_CHANGELOG_TIMEOUT: 'A change-history request timed out; automatic refresh will retry.',
+      JIRA_CHANGELOG_NETWORK_ERROR: 'The change-history connection failed; automatic refresh will retry.',
+      JIRA_CHANGELOG_HTTP_429: 'Jira requested a retry delay; automatic refresh will retry when eligible.',
+    };
+    historyMessages.push(!changelogProgress.enabled ? 'Jira field history: capture is off. Changed fields may be inferred only between saved local snapshots; open Jira History for missing details.'
+      : `Jira field history: ${changelogProgress.checked ?? 0} of ${changelogProgress.total ?? 0} tracked tickets checked · ${changelogProgress.remaining ?? 0} remaining${changelogProgress.failed ? ` · ${changelogProgress.failed} checks failed and will be retried` : ''}${changelogProgress.unavailable ? ` · ${changelogProgress.unavailable} histories unavailable` : ''}. ${setupReasons[changelogProgress.reason] || (changelogProgress.reason ? changelogProgress.transport_failed ? 'A change-history read failed; automatic refresh will retry.' : 'Change history is unavailable; check Jira access and connection settings.' : 'Progress is saved across restarts.')}`);
+    if (changelogProgress.failure_diagnostics?.length) historyMessages.push(`Jira checks: ${changelogProgress.failure_diagnostics.slice(0, 5).map(check => `${check.item_key}: ${check.error_code}`).join(' · ')}${changelogProgress.failure_diagnostics.length > 5 || changelogProgress.failure_diagnostics_truncated ? ' · More affected items are recorded in the local checkpoint' : ''}.`);
+    const retry = Date.parse(changelogProgress.retry_at);
+    if (Number.isFinite(retry)) historyMessages.push(`Jira history next eligible check: ${new Date(retry).toLocaleString()}.`);
+  }
   if (historyMessages.length) $("#historyProgress").textContent = historyMessages.join(' ');
   const guide = viewGuides[state.view];
   $("#helpTitle").textContent = `About ${views[state.view][0]}`;

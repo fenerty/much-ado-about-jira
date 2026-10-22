@@ -295,7 +295,7 @@ def test_malformed_nested_history_state_recovers_valid_subset():
     assert JiraHistory("same", {"version": 999, "scope": "same", "records": state["records"]}).records == {}
 
 
-def test_coordinator_uses_independent_jira_deadline_and_saves_checkpoint_after_snapshot(tmp_path, monkeypatch):
+def test_coordinator_uses_independent_jira_deadline_and_commits_returned_checkpoint(tmp_path, monkeypatch):
     settings = Settings(AppSettings(connector_timeout_seconds=1), AzureDevOpsSettings(),
                         JiraSettings(refresh_timeout_seconds=99), state_dir=tmp_path)
     events = []
@@ -303,12 +303,12 @@ def test_coordinator_uses_independent_jira_deadline_and_saves_checkpoint_after_s
     class RecordingStore(Store):
         def replace_connector(self, result, retention_days):
             super().replace_connector(result, retention_days)
+            if result.connector == 'jira':
+                assert self.load_connector_state('jira') == result.checkpoint
             events.append(("snapshot", result.connector))
 
         def save_connector_state(self, name, state):
-            assert ("snapshot", name) in events
-            super().save_connector_state(name, state)
-            events.append(("checkpoint", name))
+            raise AssertionError('checkpoint must be returned and committed atomically')
 
     store = RecordingStore(tmp_path / "isolated.sqlite3")
     store.initialize()
@@ -324,18 +324,18 @@ def test_coordinator_uses_independent_jira_deadline_and_saves_checkpoint_after_s
 
     async def jira_refresh():
         assert jira._saved_state == saved_state
-        return ConnectorResult(connector="jira", health=ConnectorHealth(connector="jira", state="partial", message="Synthetic"))
+        return ConnectorResult(connector="jira", checkpoint={"scope": "new", "version": 1, "cursor": 2},
+                               health=ConnectorHealth(connector="jira", state="partial", message="Synthetic"))
 
     async def ado_refresh():
         return ConnectorResult(connector="azure_devops", health=ConnectorHealth(connector="azure_devops", state="ok", message="Synthetic"))
 
     monkeypatch.setattr(refresh_module.asyncio, "wait_for", fake_wait_for)
     monkeypatch.setattr(jira, "refresh", jira_refresh)
-    monkeypatch.setattr(jira, "checkpoint", lambda: {"scope": "new", "version": 1, "cursor": 2})
     monkeypatch.setattr(coordinator.connectors[0], "refresh", ado_refresh)
     asyncio.run(coordinator.refresh())
     assert sorted(deadlines) == [65, 104]
-    assert events.index(("snapshot", "jira")) < events.index(("checkpoint", "jira"))
+    assert ("snapshot", "jira") in events
     assert Store(store.database_path).load_connector_state("jira")["cursor"] == 2
 
 
@@ -349,13 +349,13 @@ def test_coordinator_does_not_advance_checkpoint_when_snapshot_write_fails(tmp_p
     coordinator.connectors = [jira]
 
     async def refresh():
-        return ConnectorResult(connector="jira", health=ConnectorHealth(connector="jira", state="partial", message="Synthetic"))
+        return ConnectorResult(connector="jira", checkpoint={"cursor": "new"},
+                               health=ConnectorHealth(connector="jira", state="partial", message="Synthetic"))
 
     def fail_snapshot(result, retention):
         raise RuntimeError("Synthetic snapshot failure")
 
     monkeypatch.setattr(jira, "refresh", refresh)
-    monkeypatch.setattr(jira, "checkpoint", lambda: {"cursor": "new"})
     monkeypatch.setattr(store, "replace_connector", fail_snapshot)
     with pytest.raises(RuntimeError, match="snapshot failure"):
         asyncio.run(coordinator.refresh())

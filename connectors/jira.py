@@ -13,19 +13,26 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+import httpx
+
 from config import JiraSettings, source_scope
 from models import Activity, ConnectorHealth, ConnectorResult, WorkItem, utc_now
 from safety import assert_jira_read_command, safe_error
 from .base import CommandSpec, ConnectorFailure, async_run_command, display_name, local_cli_bridge, parse_datetime, parse_json_output, unique_strings
 from .jira_history import HISTORY_ROLES, JiraHistory
+from .jira_changelog import (
+    KEY_PATTERN, ChangelogBudgetExhausted, ChangelogReadError, JiraChangelogHistory,
+    JiraChangelogReader, changelog_activity, jira_origin, parse_changelog_page, valid_timestamp,
+)
 
 
 class JiraConnector:
     name = "jira"
 
-    def __init__(self, settings: JiraSettings, timeout_seconds: int):
+    def __init__(self, settings: JiraSettings, timeout_seconds: int, *, retention_days: int = 60):
         self.settings = settings
         self.timeout_seconds = timeout_seconds
+        self.retention_days = retention_days
         self._saved_state: dict = {}
         self._deadline: float | None = None
         self._command_slots = asyncio.Semaphore(4)
@@ -33,6 +40,8 @@ class JiraConnector:
         self._verified_history_roles: dict[str, set[str]] = {}
         self._enrichment_failures: list[str] = []
         self.state_loader = None
+        self.history_inventory_loader: Callable[[str], list[dict]] | None = None
+        self._changelog_coverage: dict = {}
         self.scope_verified: Callable[[str], None] | None = None
         self.verified_cache_scope: str | None = None
 
@@ -40,9 +49,16 @@ class JiraConnector:
         self._saved_state = state
         if hasattr(self, "_history"):
             del self._history
+        if hasattr(self, "_changelog"):
+            del self._changelog
 
     def checkpoint(self) -> dict:
-        return self._history.checkpoint() if hasattr(self, "_history") else {}
+        state = self._history.checkpoint() if hasattr(self, "_history") else {}
+        if hasattr(self, "_changelog"):
+            state["changelog"] = self._changelog.checkpoint()
+        elif isinstance(self._saved_state.get("changelog"), dict):
+            state["changelog"] = self._saved_state["changelog"]
+        return state
 
     def _ensure_history(self, identity: dict[str, str]) -> None:
         scope = hashlib.sha256(json.dumps({
@@ -63,6 +79,7 @@ class JiraConnector:
         self._deadline = time.monotonic() + self.settings.refresh_timeout_seconds
         self._command_slots = asyncio.Semaphore(4)
         self._enrichment_failures = []
+        self._changelog_coverage = {}
         try:
             executable = self._find_cli()
             identity = await self._authenticate(executable)
@@ -83,19 +100,32 @@ class JiraConnector:
             items, activities, mention_capability = await self._normalize(
                 executable, records, query_roles, identity
             )
+            activities.extend(await self._collect_changelog(items, identity))
+            self._mark_changelog_details(activities)
             partial_queries.extend(self._enrichment_failures)
+            if self._changelog_coverage.get("incomplete"):
+                partial_queries.append("changelog:" + (self._changelog_coverage.get("reason") or "rotating_batch"))
             partial = bool(partial_queries)
             state = "partial" if partial else "ok"
             message = "Jira refreshed successfully"
             if partial:
                 message = "Jira refreshed with some unavailable query paths"
-                if set(partial_queries) == {"closed_history:rotating_batch"}:
+                changelog_reason = self._changelog_coverage.get("reason")
+                if changelog_reason in {"JIRA_CHANGELOG_TOKEN_UNAVAILABLE", "JIRA_CHANGELOG_ACCOUNT_UNVERIFIED",
+                                        "JIRA_CHANGELOG_INVALID_ORIGIN"}:
+                    message = "Jira work refreshed; change history needs supported API-token setup"
+                elif self._changelog_coverage.get("state") == "unavailable":
+                    message = "Jira work refreshed; change-history access could not be verified; see Sync details"
+                elif self._changelog_coverage.get("failed") or self._changelog_coverage.get("transport_failed"):
+                    message = "Jira work refreshed; some change details could not be read and will retry"
+                elif set(partial_queries) <= {"closed_history:rotating_batch", "changelog:rotating_batch"}:
                     message = "Jira refreshed; older history discovery and details advance in saved batches"
             return ConnectorResult(
                 connector=self.name,
                 cache_scope=self.verified_cache_scope,
                 work_items=items,
                 activities=activities,
+                checkpoint=self.checkpoint(),
                 health=ConnectorHealth(
                     connector=self.name,
                     state=state,
@@ -105,6 +135,7 @@ class JiraConnector:
                     coverage={
                         "completed_history": {**getattr(self, "_history_progress", {}), "last_sync_seconds": (utc_now() - attempted).total_seconds()},
                         "history_discovery": self._discovery_progress,
+                        "changelog": self._changelog_coverage,
                         "site": self.settings.site,
                         "work_items": len(items),
                         "activity_projects": list(self.settings.activity_projects),
@@ -563,6 +594,157 @@ class JiraConnector:
             )
             activities.extend(comment_activity)
         return items, activities, structured_mentions_seen
+
+    def _changelog_target(self, value: WorkItem | dict, cutoff: datetime) -> dict | None:
+        raw = value.model_dump(mode="json") if isinstance(value, WorkItem) else value
+        if not isinstance(raw, dict) or raw.get("source") != "jira":
+            return None
+        key = str(raw.get("key") or "")
+        if not KEY_PATTERN.fullmatch(key) or raw.get("id") != f"jira:issue:{key}":
+            return None
+        updated = valid_timestamp(raw.get("updated_at"))
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        history_at = valid_timestamp(metadata.get("latest_activity_at")) or updated
+        if updated is None or (metadata.get("snapshot_only") and (history_at is None or history_at < cutoff)):
+            return None
+        return {"key": key, "id": raw["id"], "title": str(raw.get("title") or key),
+                "updated_at": updated, "url": f"{self.settings.site.rstrip('/')}/browse/{key}",
+                "reasons": [reason for reason in raw.get("reasons", []) if isinstance(reason, str)]}
+
+    async def _collect_changelog(self, items: list[WorkItem], identity: dict[str, str]) -> list[Activity]:
+        coverage = {"enabled": self.settings.changelog_enabled, "transport": "api_token", "state": "disabled",
+                    "reason": "", "total": 0, "checked": 0, "remaining": 0, "pending": 0, "captured": 0,
+                    "failed": 0, "unavailable": 0, "pages": 0, "attempted": 0, "events": 0,
+                    "retention_days": self.retention_days, "inventory_failed": False,
+                    "budget_exhausted": False, "transport_failed": False, "incomplete": False,
+                    "retry_at": "", "failure_diagnostics": [], "failure_diagnostics_truncated": False}
+        self._changelog_coverage = coverage
+        if not self.settings.changelog_enabled:
+            return []
+        scope = self.verified_cache_scope or source_scope(self.name, identity["site"], identity["email"])
+        if not hasattr(self, "_changelog") or self._changelog.scope != scope:
+            self._changelog = JiraChangelogHistory(scope, self._saved_state.get("changelog"))
+        history = self._changelog
+        cutoff = utc_now() - timedelta(days=self.retention_days)
+        candidates = list(items)
+        if self.history_inventory_loader is not None and self.verified_cache_scope:
+            try:
+                candidates = list(self.history_inventory_loader(self.verified_cache_scope)) + candidates
+            except (ValueError, OSError, TypeError):
+                coverage["inventory_failed"] = True
+        targets = {}
+        for value in candidates:
+            target = self._changelog_target(value, cutoff)
+            if target:
+                targets[target["key"]] = target
+        keys = set(targets) | (set(history.records) if coverage["inventory_failed"] else set())
+        history.prepare(keys, cutoff, self.retention_days)
+        for key, target in targets.items():
+            history.observe(key, target["updated_at"])
+
+        def finish(events: list[Activity], reason: str = "", unavailable: bool = False) -> list[Activity]:
+            counts = {status: sum(record["status"] == status for record in history.records.values())
+                      for status in ("pending", "captured", "failed")}
+            remaining = counts["pending"] + counts["failed"]
+            coverage.update(counts, total=len(history.records), checked=counts["captured"],
+                            remaining=remaining, events=len(events), reason=reason,
+                            unavailable=len(history.records) if unavailable else 0,
+                            incomplete=bool(unavailable or remaining or coverage["inventory_failed"] or coverage["transport_failed"]),
+                            retry_at=history.retry_at)
+            failures = [{"item_key": key, "error_code": record["error_code"], "retry_at": record["retry_at"]}
+                        for key, record in sorted(history.records.items()) if record["status"] == "failed"]
+            coverage["failure_diagnostics"] = failures[:50]
+            coverage["failure_diagnostics_truncated"] = len(failures) > 50
+            coverage["state"] = ("unavailable" if unavailable else "partial" if counts["failed"] or coverage["inventory_failed"] or coverage["transport_failed"]
+                                 else "updating" if remaining or coverage["budget_exhausted"] else "ok")
+            return events
+
+        token = os.environ.get("JIRA_API_TOKEN", "").strip()
+        if not token:
+            return finish([], "JIRA_CHANGELOG_TOKEN_UNAVAILABLE", True)
+        expected = self.settings.expected_account.strip().lower()
+        if not expected or identity.get("email", "").lower() != expected:
+            return finish([], "JIRA_CHANGELOG_ACCOUNT_UNVERIFIED", True)
+        try:
+            origin = jira_origin(self.settings.site, identity["site"])
+        except ValueError:
+            return finish([], "JIRA_CHANGELOG_INVALID_ORIGIN", True)
+        if not targets:
+            return finish([])
+        if history.retry_at and valid_timestamp(history.retry_at) > utc_now():
+            coverage["transport_failed"] = True
+            return finish([], "JIRA_CHANGELOG_HTTP_429")
+        deadline = min(time.monotonic() + self.settings.changelog_timeout_seconds,
+                       self._deadline if self._deadline is not None else float("inf"))
+        events: list[Activity] = []
+        try:
+            async with httpx.AsyncClient(auth=httpx.BasicAuth(expected, token),
+                                         headers={"Accept": "application/json"}, follow_redirects=False,
+                                         timeout=self.timeout_seconds) as client:
+                reader = JiraChangelogReader(client, origin, self.settings.changelog_request_timeout_seconds)
+                rest_identity = await reader.identity(deadline)
+                account_id = identity.get("account_id")
+                verified = (rest_identity.get("accountId") == account_id if account_id else
+                            str(rest_identity.get("emailAddress") or "").lower() == expected)
+                if not verified:
+                    return finish([], "JIRA_CHANGELOG_IDENTITY_MISMATCH", True)
+                for key in history.batch(self.settings.changelog_batch_size):
+                    if time.monotonic() >= deadline:
+                        coverage["budget_exhausted"] = True
+                        break
+                    if key not in targets:
+                        continue
+                    offset = history.start(key)
+                    coverage["attempted"] += 1
+                    try:
+                        data = await reader.page(key, offset, self.settings.changelog_page_size, deadline)
+                        rows, last = parse_changelog_page(data, offset, self.settings.changelog_page_size)
+                        page_events = []
+                        seen = {}
+                        for row in rows:
+                            timestamp = valid_timestamp(row["created"])
+                            if timestamp < cutoff:
+                                continue
+                            seen[row["id"]] = timestamp.isoformat()
+                            if row["id"] not in history.records[key]["seen"]:
+                                page_events.append(changelog_activity(targets[key], row))
+                        # Accept only fully validated pages; Store commits the
+                        # resulting checkpoint and events in one transaction.
+                        history.accept(key, offset, len(rows), last, seen)
+                        events.extend(page_events)
+                        coverage["pages"] += 1
+                    except ChangelogBudgetExhausted:
+                        coverage["budget_exhausted"] = True
+                        break
+                    except ChangelogReadError as exc:
+                        history.fail(key, exc.code, exc.retry_at)
+                        if exc.code == "JIRA_CHANGELOG_HTTP_429":
+                            history.retry_at = exc.retry_at
+                            return finish(events, exc.code)
+                    except (ValueError, TypeError):
+                        history.fail(key, "JIRA_CHANGELOG_INVALID_PAGE")
+        except ChangelogBudgetExhausted:
+            coverage["budget_exhausted"] = True
+        except ChangelogReadError as exc:
+            if exc.code == "JIRA_CHANGELOG_HTTP_429":
+                history.retry_at = exc.retry_at
+            unavailable = exc.code in {"JIRA_CHANGELOG_HTTP_401", "JIRA_CHANGELOG_HTTP_403"}
+            coverage["transport_failed"] = not unavailable
+            return finish(events, exc.code, unavailable)
+        return finish(events)
+
+    def _mark_changelog_details(self, activities: list[Activity]) -> None:
+        if not self.settings.changelog_enabled:
+            return
+        unavailable = self._changelog_coverage.get("state") == "unavailable"
+        history = getattr(self, "_changelog", None)
+        for event in activities:
+            if event.event_type != "updated" or event.source_update_id is not None:
+                continue
+            record = history.records.get(event.item_key, {}) if history else {}
+            status = record.get("status")
+            event.detail_status = ("unavailable" if unavailable or status == "captured" else
+                                   "failed" if status == "failed" or self._changelog_coverage.get("transport_failed") else "pending")
 
     async def _comment_list(self, executable: str | CommandSpec, key: str) -> list[dict[str, Any]]:
         output = await self._run(

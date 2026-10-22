@@ -202,12 +202,16 @@ class Store:
         Hidden updates and inactive work remain eligible for recovery. Reading
         this inventory never reactivates work or changes its local triage.
         """
+        sources = {'azure_devops': ('ado', 'ado:workitem:'), 'jira': ('jira', 'jira:issue:')}
+        if connector not in sources:
+            raise ValueError('History inventory requires an Azure DevOps or Jira connector')
+        source, parent_prefix = sources[connector]
         storage = self._verified_connector(connector, cache_scope)
         with self._lock, self._connect() as connection:
             rows = connection.execute('''
                 SELECT entity_kind, payload_json, active FROM entities
-                WHERE connector = ? AND source = 'ado'
-            ''', (storage,)).fetchall()
+                WHERE connector = ? AND source = ?
+            ''', (storage, source)).fetchall()
         parents = {}
         retained: dict[str, str] = {}
         for row in rows:
@@ -220,7 +224,7 @@ class Store:
                         old = retained.get(key)
                         if old is None or datetime.fromisoformat(timestamp) > datetime.fromisoformat(old):
                             retained[key] = timestamp
-            elif raw.get('id', '').startswith('ado:workitem:'):
+            elif raw.get('id', '').startswith(parent_prefix):
                 raw['metadata'] = {**raw.get('metadata', {}), 'snapshot_only': not bool(row['active'])}
                 parents[raw['id']] = (raw, bool(row['active']))
         inventory = []
@@ -253,26 +257,75 @@ class Store:
     def _legacy_activity_state(self, connection: sqlite3.Connection, storage: str,
                                raw: dict, version: str) -> tuple[str | None, str | None, str | None] | None:
         connector = storage.split('@', 1)[0]
-        previous = connection.execute('''
+        query = '''
             SELECT e.payload_json, e.version_hash, s.seen_version,
                    s.dismissed_version, s.updated_at
             FROM entities e LEFT JOIN local_state s ON s.entity_id = e.entity_id
-            WHERE e.entity_id = ? AND e.connector = ?
-              AND e.entity_kind = 'activity' AND e.source = ?
-        ''', (raw['id'], connector, raw['source'])).fetchone()
-        if previous is None:
-            return None
-        try:
-            saved = json.loads(previous['payload_json'])
-        except (ValueError, TypeError):
-            return None
-        if not isinstance(saved, dict) or self._activity_version(saved) != self._activity_version(raw):
+            WHERE e.connector = ? AND e.entity_kind = 'activity' AND e.source = ?
+        '''
+        previous = connection.execute(query + ' AND e.entity_id = ?',
+                                      (connector, raw['source'], raw['id'])).fetchall()
+        authoritative = self._history_update(raw)
+        if authoritative:
+            # A canonical history row may arrive before any scoped generic
+            # snapshot. Explicit binding still applies to its proven legacy
+            # placeholder, including an equivalent Jira timezone offset.
+            prefix = f"{raw['item_id']}:updated:"
+            previous += connection.execute(query + ' AND substr(e.entity_id, 1, ?) = ?',
+                                           (connector, raw['source'], len(prefix), prefix)).fetchall()
+        matched = None
+        for candidate in previous:
+            try:
+                saved = json.loads(candidate['payload_json'])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(saved, dict):
+                continue
+            same_content = self._activity_version(saved) == self._activity_version(raw)
+            if not same_content and authoritative:
+                same_content = self._proven_legacy_enrichment(storage, raw, saved)
+            if same_content and authoritative and saved.get('source_update_id') is None:
+                # A legacy timestamp placeholder can acknowledge only one
+                # immutable source change. The first proven scoped entity owns
+                # its alias; insertion order is stable across replay/restart and
+                # gives preview and apply the same result without writing claims.
+                prefix = self._entity_id(storage, raw['item_id'] + ':')
+                contenders = connection.execute('''
+                    SELECT payload_json FROM entities
+                    WHERE connector = ? AND entity_kind = 'activity' AND source = ?
+                      AND substr(entity_id, 1, ?) = ?
+                    ORDER BY first_seen_at, rowid
+                ''', (storage, raw['source'], len(prefix), prefix))
+                for contender in contenders:
+                    scoped = json.loads(contender['payload_json'])
+                    if self._proven_legacy_enrichment(storage, scoped, saved):
+                        same_content = scoped.get('source_update_id') == raw.get('source_update_id')
+                        break
+            if same_content:
+                matched = candidate
+                break
+        if matched is None:
             return None
         # Translate only acknowledgements of this exact retained content. A
         # stale version or an explicit Mark unread must remain unread.
-        return (version if previous['seen_version'] == previous['version_hash'] else None,
-                version if previous['dismissed_version'] == previous['version_hash'] else None,
-                previous['updated_at'])
+        return (version if matched['seen_version'] == matched['version_hash'] else None,
+                version if matched['dismissed_version'] == matched['version_hash'] else None,
+                matched['updated_at'])
+
+    def _proven_legacy_enrichment(self, storage: str, raw: dict, saved: dict) -> bool:
+        if not self._history_update(raw):
+            return False
+        incoming = Activity.model_validate(raw)
+        # Enriched scoped rows may already retain the generic ID. Recreate their
+        # canonical identity solely for proof; stored IDs and tokens stay intact.
+        if (incoming.id == saved.get('id') and self._snapshot_alias_at(
+                incoming.id, incoming.item_id, incoming.timestamp)):
+            suffix = 'change' if incoming.source == 'jira' else 'update'
+            incoming = incoming.model_copy(update={
+                'id': f'{incoming.item_id}:{suffix}:{incoming.source_update_id}',
+            })
+        enriched, proven = self._prepare_history_activity(storage, incoming, [saved])
+        return proven and enriched.id == saved.get('id')
 
     def bind_legacy_read_state(self, connector: str, cache_scope: str, *, apply: bool = False) -> dict:
         """Owner-approved continuity for one verified account's legacy updates.
@@ -353,7 +406,20 @@ class Store:
                 and raw.get('detail_status') in {'captured', 'administrative'})
 
     @staticmethod
-    def _same_ado_parent(before: dict, after: dict) -> bool:
+    def _jira_update(raw: dict) -> bool:
+        update_id = raw.get('source_update_id')
+        return (raw.get('source') == 'jira' and raw.get('event_type') == 'updated'
+                and isinstance(update_id, str) and bool(update_id.strip())
+                and update_id == update_id.strip()
+                and raw.get('detail_source') == 'Jira change history'
+                and raw.get('detail_status') in {'captured', 'administrative'})
+
+    @classmethod
+    def _history_update(cls, raw: dict) -> bool:
+        return cls._ado_update(raw) or cls._jira_update(raw)
+
+    @staticmethod
+    def _same_history_parent(before: dict, after: dict) -> bool:
         return all(before.get(key) == after.get(key)
                    for key in ('source', 'event_type', 'item_id', 'item_key'))
 
@@ -364,40 +430,60 @@ class Store:
         except (KeyError, TypeError, ValueError):
             return False
 
-    def _prepare_ado_activity(self, storage: str, activity: Activity,
-                              previous: list[dict]) -> tuple[Activity, bool]:
-        """Resolve only proven ADO identities; keep existing local IDs and tokens.
+    @staticmethod
+    def _snapshot_alias_at(alias: str | None, item_id: str, timestamp: datetime) -> bool:
+        prefix = f'{item_id}:updated:'
+        if not isinstance(alias, str) or not alias.startswith(prefix):
+            return False
+        try:
+            return datetime.fromisoformat(alias[len(prefix):]) == timestamp
+        except ValueError:
+            return False
 
-        A revision is not an update ID, and matching timestamps alone do not
-        establish identity. The connector must supply the exact old timestamp
-        ID from the authoritative ChangedDate delta before an alias is adopted.
+    def _prepare_history_activity(self, storage: str, activity: Activity,
+                                  previous: list[dict]) -> tuple[Activity, bool]:
+        """Resolve proven source identities; keep existing local IDs and tokens.
+
+        Matching timestamps alone do not establish identity. The connector must
+        supply an authoritative source change ID and exact old timestamp alias.
+        One placeholder can represent only one change, even when multiple source
+        changes share its timestamp.
         """
-        if storage.split('@', 1)[0] != 'azure_devops' or activity.source != 'ado' or activity.event_type != 'updated':
+        source = {'azure_devops': 'ado', 'jira': 'jira'}.get(storage.split('@', 1)[0])
+        if activity.source != source or activity.event_type != 'updated':
             return activity, False
         incoming = activity.model_dump(mode='json')
-        matching = [raw for raw in previous if self._same_ado_parent(raw, incoming)]
-        if self._ado_update(incoming):
+        matching = [raw for raw in previous if self._same_history_parent(raw, incoming)]
+        if self._history_update(incoming):
             for raw in matching:
-                if self._ado_update(raw) and raw['source_update_id'] == activity.source_update_id:
+                if self._history_update(raw) and raw['source_update_id'] == activity.source_update_id:
                     return activity.model_copy(update={
                         'id': raw['id'],
                         'legacy_activity_id': raw.get('legacy_activity_id') or activity.legacy_activity_id,
                     }), True
             alias = activity.legacy_activity_id
             expected_alias = f"{activity.item_id}:updated:{activity.timestamp.isoformat()}"
-            canonical = f"{activity.item_id}:update:{activity.source_update_id}"
-            if alias and alias == expected_alias and activity.id == canonical:
+            suffix = 'change' if activity.source == 'jira' else 'update'
+            canonical = f"{activity.item_id}:{suffix}:{activity.source_update_id}"
+            proven_alias = (self._snapshot_alias_at(alias, activity.item_id, activity.timestamp)
+                            if activity.source == 'jira' else alias == expected_alias)
+            if alias and proven_alias and activity.id == canonical:
                 for raw in matching:
-                    if (raw.get('id') == alias and raw.get('source_update_id') is None
+                    same_alias = (self._snapshot_alias_at(raw.get('id'), activity.item_id, activity.timestamp)
+                                  if activity.source == 'jira' else raw.get('id') == alias)
+                    if (same_alias and raw.get('source_update_id') is None
                             and self._same_event_time(raw, incoming)):
-                        return activity.model_copy(update={'id': alias}), True
+                        return activity.model_copy(update={'id': raw['id']}), True
         elif incoming.get('source_update_id') is None:
             # Current item queries still emit their generic snapshot event.
             # Keep previously recovered authoritative contents and identity so
             # that a later cursor-only refresh cannot erase the enrichment.
             for raw in matching:
-                if (self._ado_update(raw)
-                        and activity.id in {raw.get('id'), raw.get('legacy_activity_id')}
+                same_alias = (activity.id in {raw.get('id'), raw.get('legacy_activity_id')}
+                              or (activity.source == 'jira' and self._snapshot_alias_at(
+                                  activity.id, activity.item_id, activity.timestamp)))
+                if (self._history_update(raw)
+                        and same_alias
                         and self._same_event_time(raw, incoming)):
                     saved = Activity.model_validate(raw)
                     return saved.model_copy(update={
@@ -437,23 +523,26 @@ class Store:
                 current_items = {item.id: item.model_dump(mode='json') for item in result.work_items}
                 for item in result.work_items:
                     self._upsert_entity(connection, storage, "work_item", item, item.updated_at, now)
-                ado_history: dict[str, list[dict]] = {}
-                if result.connector == 'azure_devops':
+                history: dict[str, list[dict]] = {}
+                if result.connector in {'azure_devops', 'jira'}:
                     for row in connection.execute('''
                         SELECT payload_json FROM entities
-                        WHERE connector = ? AND source = 'ado' AND entity_kind = 'activity'
+                        WHERE connector = ? AND entity_kind = 'activity'
                     ''', (storage,)):
                         raw = json.loads(row['payload_json'])
-                        ado_history.setdefault(raw['item_id'], []).append(raw)
-                for activity in result.activities:
-                    activity, preserve_version = self._prepare_ado_activity(
-                        storage, activity, ado_history.get(activity.item_id, []))
+                        history.setdefault(raw['item_id'], []).append(raw)
+                # Enrich retained placeholders before a generic snapshot can
+                # infer a different content version and reset existing triage.
+                activities = sorted(result.activities, key=lambda event: not self._history_update(event.model_dump(mode='json')))
+                for activity in activities:
+                    activity, preserve_version = self._prepare_history_activity(
+                        storage, activity, history.get(activity.item_id, []))
                     if activity.item_id not in previous_items and activity.item_id not in current_items:
                         parent = WorkItem(id=activity.item_id, source=activity.source, source_type='unknown', project='', key=activity.item_key, title=activity.item_title, url=activity.url, status='Unknown', updated_at=activity.timestamp, reasons=activity.reasons, metadata={'discovered_from_update': True})
                         self._upsert_entity(connection, storage, 'work_item', parent, parent.updated_at, now)
                         connection.execute('UPDATE entities SET active = 0 WHERE entity_id = ?', (self._entity_id(storage, parent.id),))
                         previous_items[parent.id] = parent.model_dump(mode='json')
-                    if activity.event_type == 'updated' and not activity.changes and not self._ado_update(activity.model_dump(mode='json')):
+                    if activity.event_type == 'updated' and not activity.changes and not self._history_update(activity.model_dump(mode='json')):
                         existing = connection.execute("SELECT payload_json FROM entities WHERE entity_id = ? AND entity_kind = 'activity'", (self._entity_id(storage, activity.id),)).fetchone()
                         saved = json.loads(existing['payload_json']) if existing else {}
                         if saved.get('changes'):
@@ -468,8 +557,8 @@ class Store:
                         connection, storage, "activity", activity, activity.timestamp, now,
                         preserve_activity_version=preserve_version,
                     )
-                    if result.connector == 'azure_devops' and activity.source == 'ado':
-                        previous = ado_history.setdefault(activity.item_id, [])
+                    if result.connector in {'azure_devops', 'jira'}:
+                        previous = history.setdefault(activity.item_id, [])
                         previous[:] = [raw for raw in previous if raw['id'] != activity.id]
                         previous.append(activity.model_dump(mode='json'))
 
