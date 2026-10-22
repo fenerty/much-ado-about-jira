@@ -1,5 +1,6 @@
 # Copy to settings.toml and configure the sources you want to enable.
-# Keep credentials in the CLIs' own authentication stores, never in this file.
+# Keep credentials in CLI authentication stores or the launching environment.
+# Never place credentials in this file.
 [app]
 host = "127.0.0.1"
 port = 8765
@@ -19,6 +20,7 @@ max_comment_candidates = 250
 # Saved history pages rotate across current and retained work, including Hidden.
 refresh_timeout_seconds = 60
 history_timeout_seconds = 10
+history_request_timeout_seconds = 5
 history_batch_size = 50
 history_page_size = 100
 
@@ -35,3 +37,12 @@ max_candidates_per_query = 1000
 refresh_timeout_seconds = 120
 history_timeout_seconds = 15
 history_batch_size = 50
+
+# Optional field-history capture uses supported Jira REST authentication.
+# Set JIRA_API_TOKEN in the launching user's environment; never put its value here.
+# See docs/jira-changelog.md for setup and coverage limits.
+changelog_enabled = false
+changelog_batch_size = 8
+changelog_page_size = 100
+changelog_timeout_seconds = 10
+changelog_request_timeout_seconds = 5

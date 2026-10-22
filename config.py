@@ -73,6 +73,7 @@ class AzureDevOpsSettings:
     max_comment_candidates: int = 250
     refresh_timeout_seconds: int | float = 60
     history_timeout_seconds: int | float = 10
+    history_request_timeout_seconds: int | float = 5
     history_batch_size: int = 50
     history_page_size: int = 100
 
@@ -80,7 +81,7 @@ class AzureDevOpsSettings:
         _validate_integer('azure_devops', 'max_work_items', self.max_work_items)
         for name in ('mention_reply_days', 'max_comment_candidates'):
             _validate_integer('azure_devops', name, getattr(self, name), minimum=0)
-        for name in ('refresh_timeout_seconds', 'history_timeout_seconds'):
+        for name in ('refresh_timeout_seconds', 'history_timeout_seconds', 'history_request_timeout_seconds'):
             _validate_seconds('azure_devops', name, getattr(self, name))
         for name in ('history_batch_size', 'history_page_size'):
             _validate_integer('azure_devops', name, getattr(self, name))
@@ -99,11 +100,19 @@ class JiraSettings:
     refresh_timeout_seconds: int | float = 120
     history_timeout_seconds: int | float = 15
     history_batch_size: int = 50
+    changelog_enabled: bool = False
+    changelog_batch_size: int = 8
+    changelog_page_size: int = 100
+    changelog_timeout_seconds: int | float = 10
+    changelog_request_timeout_seconds: int | float = 5
 
     def __post_init__(self):
-        for name in ('max_candidates_per_query', 'history_batch_size'):
+        if type(self.changelog_enabled) is not bool:
+            raise ValueError('jira.changelog_enabled must be a boolean')
+        for name in ('max_candidates_per_query', 'history_batch_size', 'changelog_batch_size'):
             _validate_integer('jira', name, getattr(self, name))
-        for name in ('refresh_timeout_seconds', 'history_timeout_seconds'):
+        _validate_integer('jira', 'changelog_page_size', self.changelog_page_size, maximum=100)
+        for name in ('refresh_timeout_seconds', 'history_timeout_seconds', 'changelog_timeout_seconds', 'changelog_request_timeout_seconds'):
             _validate_seconds('jira', name, getattr(self, name))
         for name in ('mention_reply_days', 'participation_days'):
             _validate_integer('jira', name, getattr(self, name), minimum=0)

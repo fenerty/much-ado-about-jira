@@ -104,6 +104,51 @@ test('captured changes and history actor are escaped and do not show a missing-d
   assert.doesNotMatch(html, /<script>|<img|details unavailable|no field changes/);
 });
 
+test('Jira explains uncaptured fields without implying batches will repair them', () => {
+  const ui = setup();
+  for (const detail_status of [null, 'unavailable']) {
+    seed(ui,[event('jira-generic','ENG-1','2026-09-15',{event_type:'updated',detail_status})]);
+    assert.match(ui.element('#workList').innerHTML, /changed fields were not captured/);
+    assert.doesNotMatch(ui.element('#workList').innerHTML, /will retry|details pending/);
+  }
+  seed(ui,[event('jira-source','ENG-1','2026-09-15',{event_type:'updated',detail_status:'captured',detail_source:'Jira change history',changes:['Status: Open → Done']})]);
+  assert.match(ui.element('#workList').innerHTML, /Jira change history/);
+  assert.doesNotMatch(ui.element('#workList').innerHTML, /not captured|details unavailable/);
+});
+
+test('deleted ADO histories and normal batch deferral have different explanations', () => {
+  const ui = setup();
+  ui.run(`state.dashboard.health={azure_devops:{connector:'azure_devops',state:'partial',message:'A source item was deleted',coverage:{history_progress:{total:10,checked:9,remaining:1,pending:1,deleted:1,cooling_down:1,failure_diagnostics:[{item_key:'42',failure_category:'deleted',error_code:'HTTP_404',retry_at:'2026-09-15T12:00:00Z'}]}}}};render();`);
+  assert.match(ui.element('#historyProgress').textContent, /1 source items deleted; saved history retained/);
+  assert.match(ui.element('#historyProgress').textContent, /42: deleted \(HTTP_404\)/);
+  assert.doesNotMatch(ui.element('#historyProgress').textContent, /checks? failed and will be retried/);
+  assert.match(ui.element('#health').innerHTML, /Partial coverage/);
+  ui.run(`state.dashboard.health.azure_devops.coverage.history_progress={total:10,checked:9,remaining:1,pending:1,budget_deferred:1};render();`);
+  assert.match(ui.element('#historyProgress').textContent, /Batch time limit reached/);
+  assert.match(ui.element('#health').innerHTML, /Synced · change details updating/);
+  assert.equal(ui.element('#notice').hidden, true);
+  ui.run(`state.dashboard.health.azure_devops.coverage.history_progress={total:10,checked:10,remaining:0,metadata_status:'pending',budget_deferred:1};render();`);
+  assert.equal(ui.element('#notice').hidden, true);
+});
+
+test('Jira changelog setup and failures cannot hide behind older-ticket progress', () => {
+  const ui = setup();
+  ui.run(`state.dashboard.health={jira:{connector:'jira',state:'partial',message:'Change history needs setup',coverage:{completed_history:{total:50,checked:16,remaining:34,batches_remaining:3,eta_seconds:540},unavailable_queries:['closed_history:rotating_batch'],changelog:{enabled:true,state:'unavailable',reason:'JIRA_CHANGELOG_TOKEN_UNAVAILABLE'}}}};render();`);
+  assert.equal(ui.element('#notice').hidden, false);
+  assert.match(ui.element('#health').innerHTML, /Partial coverage/);
+  assert.match(ui.element('#historyProgress').textContent, /Set JIRA_API_TOKEN/);
+  ui.run(`state.dashboard.health.jira.coverage.changelog={enabled:true,state:'updating',total:12,checked:4,remaining:8};state.dashboard.health.jira.coverage.unavailable_queries.push('changelog:rotating_batch');render();`);
+  assert.equal(ui.element('#notice').hidden, true);
+  assert.match(ui.element('#health').innerHTML, /Synced · field history updating/);
+  assert.match(ui.element('#historyProgress').textContent, /Jira field history: 4 of 12/);
+  ui.run(`state.dashboard.health.jira.coverage.changelog={enabled:true,state:'partial',failed:1};render();`);
+  assert.equal(ui.element('#notice').hidden, false);
+  ui.run(`state.dashboard.health.jira.coverage.changelog={enabled:true,state:'partial',reason:'JIRA_CHANGELOG_TIMEOUT',transport_failed:true,failure_diagnostics:[{item_key:'ENG-42',error_code:'JIRA_CHANGELOG_HTTP_404'}]};render();`);
+  assert.match(ui.element('#historyProgress').textContent, /request timed out; automatic refresh will retry/);
+  assert.match(ui.element('#historyProgress').textContent, /ENG-42: JIRA_CHANGELOG_HTTP_404/);
+  assert.doesNotMatch(ui.element('#historyProgress').textContent, /Set JIRA_API_TOKEN|check Jira access/);
+});
+
 test('default retains all updates; latest uses parent identity, newest timestamp and stable ID tie break', () => {
   const ui = setup();
   const events = [event('older','jira:A','2026-09-01'),event('z','jira:A','2026-09-15'),event('a','jira:A','2026-09-15'),event('ado','ado:A','2026-09-14',{source:'ado'}),event('missing','jira:B',null)];

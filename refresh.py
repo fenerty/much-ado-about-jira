@@ -22,7 +22,8 @@ class RefreshCoordinator:
         self.connectors = [
             AzureDevOpsConnector(settings.azure_devops, settings.app.connector_timeout_seconds,
                                  retention_days=settings.app.activity_retention_days),
-            JiraConnector(settings.jira, settings.app.connector_timeout_seconds),
+            JiraConnector(settings.jira, settings.app.connector_timeout_seconds,
+                          retention_days=settings.app.activity_retention_days),
         ]
         for connector in self.connectors:
             connector.scope_verified = lambda cache_scope, name=connector.name: self._activate_scope(
@@ -35,6 +36,9 @@ class RefreshCoordinator:
             'azure_devops', cache_scope=cache_scope
         )
         self.connectors[1].state_loader = lambda cache_scope: self.store.load_connector_state(
+            'jira', cache_scope=cache_scope
+        )
+        self.connectors[1].history_inventory_loader = lambda cache_scope: self.store.history_inventory(
             'jira', cache_scope=cache_scope
         )
 
@@ -59,9 +63,6 @@ class RefreshCoordinator:
                         self._activate_scope(result.connector, result.cache_scope)
                     if result.health.state in {"ok", "partial"}:
                         self.store.replace_connector(result, self.settings.app.activity_retention_days)
-                        if result.connector == "jira":
-                            jira = next(connector for connector in self.connectors if connector.name == "jira")
-                            self.store.save_connector_state("jira", jira.checkpoint())
                     else:
                         self.store.record_health(result.health, cache_scope=result.cache_scope)
                 except Exception as exc:
